@@ -43,10 +43,8 @@ import {
   patternResolveSar,
   patternBackfillFromCandles,
   patternRecomputeStats,
-  patternRegimeAt,
   patternId,
   dbAdd,
-  dbGet,
   dbPut,
   dbIndexGet,
   dbAll,
@@ -108,40 +106,14 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 export default function Home() {
   // Navigation & Core State
-  const [symbol, setSymbol] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('fs_symbol') || 'BTCUSDT';
-    }
-    return 'BTCUSDT';
-  });
-  const [interval, setInterval] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      return localStorage.getItem('fs_interval') || '5m';
-    }
-    return '5m';
-  });
+  const [symbol, setSymbol] = useState<string>('BTCUSDT');
+  const [interval, setInterval] = useState<string>('5m');
   const [activeView, setActiveView] = useState<'chart' | 'signal' | 'scanner' | 'pool' | 'settings'>('chart');
   const [symbols, setSymbols] = useState<string[]>([]);
   const [tickers, setTickers] = useState<Ticker24h[]>([]);
-  const [favs, setFavs] = useState<string[]>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('fs_favs');
-        if (saved) return JSON.parse(saved);
-      } catch {}
-    }
-    return [];
-  });
+  const [favs, setFavs] = useState<string[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
-  const [settings, setSettings] = useState<AppSettings>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const saved = localStorage.getItem('fs_settings');
-        if (saved) return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
-      } catch {}
-    }
-    return DEFAULT_SETTINGS;
-  });
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
 
   // Real-time Flow State
   const [lastPrice, setLastPrice] = useState<number>(0);
@@ -250,9 +222,32 @@ export default function Home() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isSignalOpen, setIsSignalOpen] = useState(false);
 
-  // Initialize DB on Mount
+  // Initialize DB and load saved preferences on Mount (safe from SSR hydration mismatch)
   useEffect(() => {
     initPatternDB();
+    const timer = setTimeout(() => {
+      try {
+        const savedSymbol = localStorage.getItem('fs_symbol');
+        if (savedSymbol) setSymbol(savedSymbol);
+        const savedInterval = localStorage.getItem('fs_interval');
+        if (savedInterval) setInterval(savedInterval);
+        const savedFavs = localStorage.getItem('fs_favs');
+        if (savedFavs) {
+          const parsed = JSON.parse(savedFavs);
+          if (Array.isArray(parsed)) setFavs(parsed);
+        }
+        const savedSettings = localStorage.getItem('fs_settings');
+        if (savedSettings) {
+          const parsed = JSON.parse(savedSettings);
+          if (parsed && typeof parsed === 'object') {
+            setSettings((prev) => ({ ...prev, ...parsed }));
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to load localStorage preferences:', e);
+      }
+    }, 0);
+    return () => clearTimeout(timer);
   }, []);
 
   // Keyboard shortcut for Fullscreen (F key) and Esc

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import {
   createChart,
   CandlestickSeries,
@@ -110,6 +110,8 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   const macdHistRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const markerPrimitiveRef = useRef<any>(null);
 
+  const lastBarTimeRef = useRef<number | null>(null);
+
   // Overlay Canvases
   const heatmapCanvasRef = useRef<HTMLCanvasElement>(null);
   const domOverlayCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -126,6 +128,23 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       }
     }
   };
+
+  // Memoized Indicators (Recalculate only when candles or settings change)
+  const indicatorData = useMemo(() => {
+    if (!candles.length) return null;
+    const closes = candles.map((c) => c.close);
+    return {
+      closes,
+      ma1: sma(closes, settings.ma1 || 9),
+      ma2: sma(closes, settings.ma2 || 21),
+      ma3: sma(closes, settings.ma3 || 50),
+      sar: psar(candles, settings.sarStep || 0.02, settings.sarMax || 0.2).sar,
+      bb: bollingerBands(candles, settings.bbPeriod || 20, settings.bbStd || 2),
+      vwap: vwap(candles),
+      rsi: rsi(closes, settings.rsiPeriod || 14),
+      macd: macd(closes, settings.macdFast || 12, settings.macdSlow || 26, settings.macdSignal || 9)
+    };
+  }, [candles, settings]);
 
   // Initialize Lightweight Charts
   useEffect(() => {
@@ -321,9 +340,9 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
 
   // Update Series Data on Candle or Settings Change
   useEffect(() => {
-    if (!chartRef.current || !candleSeriesRef.current || !candles.length) return;
+    if (!chartRef.current || !candleSeriesRef.current || !candles.length || !indicatorData) return;
 
-    // 1. Candlesticks
+    // 1. Candlesticks & Volume (Incremental update on live bar tick, full setData on bar-add or symbol/interval reset)
     const candleData: CandlestickData<Time>[] = candles.map((c) => ({
       time: c.time as Time,
       open: c.open,
@@ -331,32 +350,42 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       low: c.low,
       close: c.close
     }));
-    candleSeriesRef.current.setData(candleData);
 
-    // 2. Volume
-    if (volSeriesRef.current) {
-      const volData: HistogramData<Time>[] = settings.showVol
-        ? candles.map((c) => ({
-            time: c.time as Time,
-            value: c.volume,
-            color: c.close >= c.open ? 'rgba(38, 166, 154, 0.4)' : 'rgba(239, 83, 80, 0.4)'
-          }))
-        : [];
-      volSeriesRef.current.setData(volData);
+    const last = candles[candles.length - 1];
+    const isUpdatingLastBar = lastBarTimeRef.current === last.time;
+    lastBarTimeRef.current = last.time;
+
+    if (isUpdatingLastBar && candleSeriesRef.current) {
+      // Live tick on same active candle: O(1) single-point update
+      const lastCandle = candleData[candleData.length - 1];
+      candleSeriesRef.current.update(lastCandle);
+      if (volSeriesRef.current && settings.showVol) {
+        const volColor = last.close >= last.open ? 'rgba(38, 166, 154, 0.4)' : 'rgba(239, 83, 80, 0.4)';
+        volSeriesRef.current.update({ time: last.time as Time, value: last.volume, color: volColor });
+      }
+    } else {
+      // Full batch setData on new candle arrival or symbol/interval switch
+      candleSeriesRef.current.setData(candleData);
+      if (volSeriesRef.current) {
+        const volData: HistogramData<Time>[] = settings.showVol
+          ? candles.map((c) => ({
+              time: c.time as Time,
+              value: c.volume,
+              color: c.close >= c.open ? 'rgba(38, 166, 154, 0.4)' : 'rgba(239, 83, 80, 0.4)'
+            }))
+          : [];
+        volSeriesRef.current.setData(volData);
+      }
     }
 
-    const closes = candles.map((c) => c.close);
-
-    // 3. MAs
-    const ma1 = sma(closes, settings.ma1 || 9);
-    const ma2 = sma(closes, settings.ma2 || 21);
-    const ma3 = sma(closes, settings.ma3 || 50);
+    const { ma1, ma2, ma3, sar, bb, vwap: vw, rsi: r, macd: m } = indicatorData;
 
     const mapLineData = (arr: (number | null)[]): LineData<Time>[] =>
       candles
         .map((c, i) => (arr[i] !== null ? { time: c.time as Time, value: arr[i]! } : null))
         .filter((d): d is LineData<Time> => d !== null);
 
+    // 2. MAs
     if (ma1SeriesRef.current) {
       ma1SeriesRef.current.applyOptions({ color: settings.ma1Color || '#e0b64c', lineWidth: (settings.ma1Width as any) || 1 });
       ma1SeriesRef.current.setData(settings.showMa ? mapLineData(ma1) : []);
@@ -370,36 +399,31 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       ma3SeriesRef.current.setData(settings.showMa ? mapLineData(ma3) : []);
     }
 
-    // 4. SAR
+    // 3. SAR
     if (sarSeriesRef.current) {
       sarSeriesRef.current.applyOptions({ color: settings.sarColor || '#9aa4ae' });
-      const { sar } = psar(candles, settings.sarStep || 0.02, settings.sarMax || 0.2);
       sarSeriesRef.current.setData(settings.showSar ? mapLineData(sar) : []);
     }
 
-    // 5. Bollinger Bands
+    // 4. Bollinger Bands
     if (bbUpperRef.current && bbMidRef.current && bbLowerRef.current) {
-      const bb = bollingerBands(candles, settings.bbPeriod || 20, settings.bbStd || 2);
       bbUpperRef.current.setData(settings.showBB ? mapLineData(bb.upper) : []);
       bbMidRef.current.setData(settings.showBB ? mapLineData(bb.mid) : []);
       bbLowerRef.current.setData(settings.showBB ? mapLineData(bb.lower) : []);
     }
 
-    // 6. VWAP
+    // 5. VWAP
     if (vwapSeriesRef.current) {
-      const vw = vwap(candles);
       vwapSeriesRef.current.setData(settings.showVwap ? mapLineData(vw) : []);
     }
 
-    // 7. RSI
+    // 6. RSI
     if (rsiSeriesRef.current) {
-      const r = rsi(closes, settings.rsiPeriod || 14);
       rsiSeriesRef.current.setData(settings.showRsi ? mapLineData(r) : []);
     }
 
-    // 8. MACD
+    // 7. MACD
     if (macdLineRef.current && macdSigRef.current && macdHistRef.current) {
-      const m = macd(closes, settings.macdFast || 12, settings.macdSlow || 26, settings.macdSignal || 9);
       macdLineRef.current.setData(settings.showMacd ? mapLineData(m.line) : []);
       macdSigRef.current.setData(settings.showMacd ? mapLineData(m.signal) : []);
       const histData: HistogramData<Time>[] = [];
@@ -416,8 +440,12 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       }
       macdHistRef.current.setData(histData);
     }
+  }, [candles, settings, indicatorData]);
 
-    // Markers: Signals + Liquidations + Whale Events
+  // Markers: Signals + Liquidations + Whale Events (Separate effect - updates on events, not every tick)
+  useEffect(() => {
+    if (!chartRef.current || !candleSeriesRef.current) return;
+
     const markers: SeriesMarker<Time>[] = [];
     const tfSec = intervalToSeconds(interval);
 
@@ -481,12 +509,12 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       // Fallback
     }
   }, [
-    candles,
-    flowEvents,
-    liquidations,
-    settings,
     signals,
-    interval
+    liquidations,
+    flowEvents,
+    interval,
+    settings.showLiq,
+    settings.whaleAlerts
   ]);
 
   // Canvas Heatmap & DOM Overlays
