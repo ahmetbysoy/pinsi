@@ -397,11 +397,28 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
 
     // Markers: Signals + Liquidations + Whale Events
     const markers: SeriesMarker<Time>[] = [];
+    const candleTimes = candles.map((c) => c.time);
+    const snapTime = (tsSec: number): Time => {
+      if (candleTimes.length === 0) return tsSec as Time;
+      if (tsSec <= candleTimes[0]) return candleTimes[0] as Time;
+      if (tsSec >= candleTimes[candleTimes.length - 1]) return candleTimes[candleTimes.length - 1] as Time;
+      let lo = 0;
+      let hi = candleTimes.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (candleTimes[mid] === tsSec) return candleTimes[mid] as Time;
+        if (candleTimes[mid] < tsSec) lo = mid + 1;
+        else hi = mid - 1;
+      }
+      const tLo = candleTimes[hi] ?? candleTimes[0];
+      const tHi = candleTimes[lo] ?? candleTimes[candleTimes.length - 1];
+      return (Math.abs(tsSec - tLo) <= Math.abs(tsSec - tHi) ? tLo : tHi) as Time;
+    };
 
     // Signals
     signals.forEach((s) => {
       markers.push({
-        time: s.ts as Time,
+        time: snapTime(s.ts),
         position: s.dir === 'AL' ? 'belowBar' : 'aboveBar',
         color: s.dir === 'AL' ? '#26a69a' : '#ef5350',
         shape: s.dir === 'AL' ? 'arrowUp' : 'arrowDown',
@@ -413,7 +430,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     if (settings.showLiq) {
       liquidations.slice(-20).forEach((liq) => {
         markers.push({
-          time: (liq.ts / 1000) as Time,
+          time: snapTime(Math.floor(liq.ts / 1000)),
           position: liq.side === 'BUY' ? 'belowBar' : 'aboveBar',
           color: liq.side === 'BUY' ? '#ef5350' : '#26a69a',
           shape: 'circle',
@@ -429,7 +446,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
         .slice(-15)
         .forEach((w) => {
           markers.push({
-            time: (w.ts / 1000) as Time,
+            time: snapTime(Math.floor(w.ts / 1000)),
             position: 'aboveBar',
             color: '#f59e0b',
             shape: 'square',

@@ -13,6 +13,7 @@ import {
   AlertTriangle
 } from 'lucide-react';
 import { PatternStats } from '@/lib/types';
+import { fetchKlines } from '@/lib/binance';
 import {
   initPatternDB,
   dbAll,
@@ -20,6 +21,7 @@ import {
   patternName,
   patternRecomputeStats,
   patternGetStats,
+  patternBackfillFromCandles,
   dbAdd,
   dbIndexGet
 } from '@/lib/pattern-engine';
@@ -138,19 +140,9 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
   const runBackfillScan = async () => {
     setBackfilling(true);
     try {
-      // Fetch 600 klines and backfill for current symbol
-      const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=600`);
-      if (res.ok) {
-        const raw = await res.json();
-        const cs = raw.map((k: any) => ({
-          time: Math.floor(k[0] / 1000),
-          open: parseFloat(k[1]),
-          high: parseFloat(k[2]),
-          low: parseFloat(k[3]),
-          close: parseFloat(k[4]),
-          volume: parseFloat(k[5])
-        }));
-        const { patternBackfillFromCandles } = await import('@/lib/pattern-engine');
+      // Fetch 600 klines with timeout protection and backfill for current symbol
+      const cs = await fetchKlines(symbol, interval, 600);
+      if (cs && cs.length > 0) {
         await patternBackfillFromCandles(symbol, interval, cs);
       }
       await loadStats();

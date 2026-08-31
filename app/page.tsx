@@ -43,6 +43,7 @@ import {
   patternResolveSar,
   patternBackfillFromCandles,
   patternRecomputeStats,
+  patternRegimeAt,
   patternId,
   dbAdd,
   dbGet,
@@ -229,6 +230,7 @@ export default function Home() {
   const lastSweepRef = useRef<number>(0);
   const lastAbsorbRef = useRef<number>(0);
   const lastBurstRef = useRef<number>(0);
+  const lastDepthUiUpdateRef = useRef<number>(0);
   const prevWallsRef = useRef<Map<number, { notional: number; ts: number; side: 'B' | 'A' }>>(new Map());
   const pendingEngineRef = useRef<{ dir: 'AL' | 'SAT'; idx: number; flip: boolean } | null>(null);
   const trackingEventsRef = useRef<Array<{ eventKey: string; candleIdx: number; dir: 'AL' | 'SAT' }>>([]);
@@ -366,16 +368,20 @@ export default function Home() {
     };
   }, [symbol, interval]);
 
-  // 3. Open Interest & Funding Rate Poller (Bug fix: no nested setState)
+  // 3. Open Interest & Funding Rate Poller (Tracks delta between polls)
   useEffect(() => {
     const pollOI = async () => {
       try {
         const [oi, prem] = await Promise.all([fetchOpenInterest(symbol), fetchPremiumIndex(symbol)]);
         if (oi !== null) {
-          setOpenInterest(oi);
-          if (prevOiRef.current === null) {
-            prevOiRef.current = oi;
-          }
+          setOpenInterest((currentPrev) => {
+            if (currentPrev !== null) {
+              prevOiRef.current = currentPrev;
+            } else if (prevOiRef.current === null) {
+              prevOiRef.current = oi;
+            }
+            return oi;
+          });
         }
         if (prem.fundingRate !== null) setFundingRate(prem.fundingRate);
         if (prem.markPrice !== null) setMarkPrice(prem.markPrice);
@@ -766,6 +772,9 @@ export default function Home() {
               const stats = await patternGetStats(`${interval}:${patKey}`);
               setActivePatternStats(stats);
 
+              // Calculate real market regime matching backfill
+              const liveRegime = patternRegimeAt(ctx, i, currSettings.ma3 || 50);
+
               // Record Live Pattern Event to DB for ongoing tracking & learning
               const eventKey = `${symbol}_${interval}_${cs[i].time}_${patKey}`;
               const globalKey = `${interval}:${patKey}`;
@@ -785,9 +794,9 @@ export default function Home() {
                 patternId: patKey,
                 patternKey: globalKey,
                 coinPatternKey: coinKey,
-                volRegime: 'MID',
-                trendRegime: p.dir === 'AL' ? 'UP' : 'DOWN',
-                regimeKey: `MID_${p.dir === 'AL' ? 'UP' : 'DOWN'}`,
+                volRegime: liveRegime.vol,
+                trendRegime: liveRegime.trend,
+                regimeKey: liveRegime.key,
                 refClose: cs[i].close,
                 status: 'tracking',
                 createdAt: Date.now()
@@ -943,10 +952,16 @@ export default function Home() {
         }
       },
       onDepthUpdate: (depth) => {
-        setBidsBook(new Map(depth.bids));
-        setAsksBook(new Map(depth.asks));
+        bidsBookRef.current = depth.bids;
+        asksBookRef.current = depth.asks;
 
         const now = Date.now();
+        if (now - lastDepthUiUpdateRef.current >= 200) {
+          lastDepthUiUpdateRef.current = now;
+          setBidsBook(new Map(depth.bids));
+          setAsksBook(new Map(depth.asks));
+        }
+
         const whaleMin = settingsRef.current.whaleMin || 300000;
 
         // Spoofing Detector: Check if massive wall disappeared without significant trade volume

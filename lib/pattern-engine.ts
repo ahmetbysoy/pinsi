@@ -405,6 +405,18 @@ export async function patternBackfillFromCandles(
   let settled = 0;
   const affectedKeys = new Set<string>();
 
+  // Fetch all existing events for this coin in one batch index query
+  const existingEventsList = await dbIndexAll<PatternEvent>('events', 'coin', coin);
+  const existingMap = new Map<string, PatternEvent>();
+  existingEventsList.forEach((ev) => {
+    if (ev.timeframe === timeframe && ev.eventKey) {
+      existingMap.set(ev.eventKey, ev);
+    }
+  });
+
+  const eventsToAdd: PatternEvent[] = [];
+  const eventsToUpdate: PatternEvent[] = [];
+
   for (let i = ma3 + 5; i < n; i++) {
     const crosses = patternCrossesAt(ctx, i, ma1, ma2, ma3);
     for (const cr of crosses) {
@@ -417,7 +429,7 @@ export async function patternBackfillFromCandles(
       const coinKey = `${coin}:${timeframe}:${patId}`;
       const eventKey = `${coin}_${timeframe}_${candles[i].time}_${patId}`;
 
-      const existing = await dbIndexGet<PatternEvent>('events', 'eventKey', eventKey);
+      const existing = existingMap.get(eventKey);
       const outcome = patternOutcome(candles, sarRes ? sarRes.finalIndex : i, cr.dir);
 
       if (existing) {
@@ -432,7 +444,7 @@ export async function patternBackfillFromCandles(
           existing.rMultiple = outcome.rMultiple;
           existing.barsToMfe = outcome.barsToMfe;
           existing.barsToMae = outcome.barsToMae;
-          await dbPut('events', existing);
+          eventsToUpdate.push(existing);
           settled++;
           affectedKeys.add(globalKey);
           affectedKeys.add(coinKey);
@@ -464,12 +476,26 @@ export async function patternBackfillFromCandles(
         ...(outcome || {})
       };
 
-      await dbAdd('events', ev);
+      eventsToAdd.push(ev);
+      existingMap.set(eventKey, ev);
       added++;
       if (outcome) {
         settled++;
         affectedKeys.add(globalKey);
         affectedKeys.add(coinKey);
+      }
+    }
+  }
+
+  // Batch commit to IndexedDB
+  if (eventsToAdd.length > 0 || eventsToUpdate.length > 0) {
+    const store = dbTx('events', 'readwrite');
+    if (store) {
+      for (const ev of eventsToAdd) {
+        store.add(ev);
+      }
+      for (const ev of eventsToUpdate) {
+        store.put(ev);
       }
     }
   }
