@@ -294,8 +294,43 @@ export default function Home() {
     } catch {}
   };
 
+  // Settle open tracking events gracefully before switching context (F2-7 & F2-8)
+  const settleOpenTrackingEvents = async (cs: Candle[]) => {
+    const tracking = trackingEventsRef.current;
+    if (!tracking.length || !cs.length) return;
+    for (const tr of tracking) {
+      try {
+        const outcome = patternOutcome(cs, tr.candleIdx, tr.dir === 'AL' ? 'UP' : 'DOWN');
+        const ev = await dbIndexGet<PatternEvent>('events', 'eventKey', tr.eventKey);
+        if (ev && ev.status !== 'settled') {
+          ev.status = 'settled';
+          ev.settledAt = Date.now();
+          if (outcome) {
+            ev.ret5 = outcome.ret5;
+            ev.ret10 = outcome.ret10;
+            ev.ret20 = outcome.ret20;
+            ev.mfe20 = outcome.mfe20;
+            ev.mae20 = outcome.mae20;
+            ev.rMultiple = outcome.rMultiple;
+            ev.barsToMfe = outcome.barsToMfe;
+            ev.barsToMae = outcome.barsToMae;
+          }
+          await dbPut('events', ev);
+          if (ev.patternKey) {
+            await patternRecomputeStats(ev.patternKey, settingsRef.current.patternWinPct || 0.15);
+          }
+          if (ev.coinPatternKey) {
+            await patternRecomputeStats(ev.coinPatternKey, settingsRef.current.patternWinPct || 0.15);
+          }
+        }
+      } catch {}
+    }
+    trackingEventsRef.current = [];
+  };
+
   const handleSelectSymbol = (sym: string) => {
     if (sym === symbol) return;
+    settleOpenTrackingEvents(candlesRef.current);
     setSymbol(sym);
     try {
       localStorage.setItem('fs_symbol', sym);
@@ -323,6 +358,7 @@ export default function Home() {
 
   const handleSelectInterval = (tf: string) => {
     if (tf === interval) return;
+    settleOpenTrackingEvents(candlesRef.current);
     setInterval(tf);
     try {
       localStorage.setItem('fs_interval', tf);
@@ -553,9 +589,9 @@ export default function Home() {
     };
   }, [fundingRate, markPrice, nextFundingTime, openInterest]);
 
-  // 5. Evaluate Raw Flow Scoring (Katman 2)
+  // 5. Evaluate Raw Flow Scoring (Katman 2) & Pattern Pool Multi-Confluence (F1-4, F2-1)
   const evaluateRawFlow = useCallback(
-    (dir: 'AL' | 'SAT', idx: number): DecisionEvaluation => {
+    (dir: 'AL' | 'SAT', idx: number, patternStats?: PatternStats | null): DecisionEvaluation => {
       const currSettings = settingsRef.current;
       if (!currSettings.rawConfirm) {
         return {
@@ -580,6 +616,7 @@ export default function Home() {
         reasons.push('Derinlik orderbook senkronize ediliyor.');
       }
 
+      // CVD Slope & Bias Multi-Timeframe Confluence (F1-4)
       if (dir === 'SAT') {
         if (snap.cvdBias < -0.12) {
           score += 14;
@@ -590,6 +627,14 @@ export default function Home() {
         } else if (snap.cvdBias > 0.1) {
           score -= 12;
           reasons.push('Uyuşmazlık: CVD alıcı tarafta; SAT güveni zayıfladı.');
+        }
+
+        if (snap.cvdSlope < -0.05) {
+          score += 8;
+          reasons.push(`CVD Eğim İvmesi Negatif (%${(snap.cvdSlope * 100).toFixed(1)}); satış akışı ivmeleniyor.`);
+        } else if (snap.cvdSlope > 0.08) {
+          score -= 8;
+          reasons.push(`CVD Eğim Uyuşmazlığı: Alış ivmesi toparlanıyor (+%${(snap.cvdSlope * 100).toFixed(1)}).`);
         }
 
         if (snap.obi < -0.1) {
@@ -620,6 +665,14 @@ export default function Home() {
           } else if (snap.cvdBias < -0.1) {
             score -= 10;
             reasons.push('Uyuşmazlık: CVD satıcı tarafta; AL sinyali zayıfladı.');
+          }
+
+          if (snap.cvdSlope > 0.05) {
+            score += 8;
+            reasons.push(`CVD Eğim İvmesi Pozitif (+%${(snap.cvdSlope * 100).toFixed(1)}); alış akışı ivmeleniyor.`);
+          } else if (snap.cvdSlope < -0.08) {
+            score -= 8;
+            reasons.push(`CVD Eğim Uyuşmazlığı: Satış ivmesi derinleşiyor (%${(snap.cvdSlope * 100).toFixed(1)}).`);
           }
 
           if (snap.obi > 0.1) {
@@ -682,6 +735,30 @@ export default function Home() {
         } else if (snap.funding < -0.00025 && dir === 'AL') {
           score += 8;
           reasons.push(`Aşırı negatif funding (%${(snap.funding * 100).toFixed(4)}); short squeeze/AL lehine.`);
+        }
+      }
+
+      // Pattern Pool Intelligence Confluence (F2-1: Wilson Lower Bound & MFE/MAE)
+      if (patternStats && patternStats.n >= 4) {
+        if (patternStats.wilsonLower >= 55) {
+          const bonus = Math.min(15, Math.round((patternStats.wilsonLower - 50) * 0.75));
+          score += bonus;
+          reasons.push(`Desen Havuzu Güçlü (+${bonus}p): %${patternStats.winRate.toFixed(1)} WinRate (Wilson Alt: %${patternStats.wilsonLower.toFixed(1)}, n=${patternStats.n})`);
+        } else if (patternStats.wilsonLower < 38) {
+          const penalty = Math.min(15, Math.round((42 - patternStats.wilsonLower) * 0.75));
+          score -= penalty;
+          reasons.push(`Desen Havuzu Zayıf (-${penalty}p): Wilson alt sınırı %${patternStats.wilsonLower.toFixed(1)} (Geçmiş performans düşük, n=${patternStats.n})`);
+        }
+
+        if (patternStats.avgMfe20 > 0 && patternStats.avgMae20 > 0) {
+          const rr = patternStats.avgMfe20 / (patternStats.avgMae20 || 0.01);
+          if (rr >= 1.4) {
+            score += 8;
+            reasons.push(`MFE/MAE Oranı Üstün (+8p): ${rr.toFixed(2)}x (MFE: +%${patternStats.avgMfe20.toFixed(2)}, MAE: -%${patternStats.avgMae20.toFixed(2)})`);
+          } else if (rr < 0.75) {
+            score -= 8;
+            reasons.push(`MFE/MAE Oranı Olumsuz (-8p): ${rr.toFixed(2)}x (Risk/Ödül negatif)`);
+          }
         }
       }
 
@@ -795,17 +872,7 @@ export default function Home() {
                 : ma2[i]! < ma3[i]! || ctx.closes[i] < ma3[i]!;
 
             if (ok) {
-              // FIRE SIGNAL!
-              const rule = `MA${currSettings.ma1}×MA${currSettings.ma2} ${p.dir === 'AL' ? 'Golden' : 'Death'} Cross + SAR Flip (${elapsed} mum sonra) + MA${currSettings.ma3} Trend Filtresi`;
-              const evalRes = evaluateRawFlow(p.dir, i);
-              setStatus(p.dir);
-              setStatusRule(rule);
-              setEvaluation(evalRes);
-
-              const comment = generateCommentary(p.dir, evalRes);
-              setCommentary(comment);
-
-              // Query pattern stats
+              // Query pattern stats first for dual-signal confirmation (F2-1)
               const sarBucket = elapsed === 0 ? 'SAR0' : elapsed === 1 ? 'SAR1' : elapsed <= 3 ? 'SAR2-3' : 'SARX';
               const crossInfo = p.cross;
               const filter: 'F1' | 'F0' = crossInfo ? crossInfo.filter : 'F1';
@@ -822,6 +889,16 @@ export default function Home() {
               setActivePatternId(patKey);
               const stats = await patternGetStats(`${interval}:${patKey}`);
               setActivePatternStats(stats);
+
+              // Evaluate Raw Flow with Pattern Pool Dual-Signal Confluence (F2-1)
+              const rule = `MA${currSettings.ma1}×MA${currSettings.ma2} ${p.dir === 'AL' ? 'Golden' : 'Death'} Cross + SAR Flip (${elapsed} mum sonra) + MA${currSettings.ma3} Trend Filtresi`;
+              const evalRes = evaluateRawFlow(p.dir, i, stats);
+              setStatus(p.dir);
+              setStatusRule(rule);
+              setEvaluation(evalRes);
+
+              const comment = generateCommentary(p.dir, evalRes);
+              setCommentary(comment);
 
               // Record Live Pattern Event to DB for ongoing tracking & learning
               const eventKey = `${symbol}_${interval}_${cs[i].time}_${patKey}`;
@@ -956,23 +1033,30 @@ export default function Home() {
           });
         }
 
-        // 3. Delta Burst Detector (rapid CVD surge in <5s)
+        // 3. Delta Burst Detector (rapid CVD surge in <5s confirmed by 1-min cumulative cvdSlope) (F1-4)
         if (now - lastBurstRef.current > 8000) {
           const recent5s = tradesRef.current.filter((t) => now - t.ts < 5000);
           const cvd5s = recent5s.reduce((a, b) => a + b.delta, 0);
           const vol5s = recent5s.reduce((a, b) => a + b.notional, 0);
           if (vol5s > whaleMin * 1.8 && Math.abs(cvd5s) / vol5s > 0.75) {
-            lastBurstRef.current = now;
-            const side = cvd5s > 0 ? 'buy' : 'sell';
-            const ev: FlowEvent = {
-              id: `${now}-${Math.random()}`,
-              type: 'DELTA_BURST',
-              sev: 'high',
-              text: `DELTA BURST ${side.toUpperCase()} CVD: $${(cvd5s / 1000).toFixed(0)}k (Hacim: $${(vol5s / 1000).toFixed(0)}k)`,
-              ts: now,
-              side
-            };
-            setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
+            // Check 60s slope direction alignment
+            const recent60s = tradesRef.current.filter((t) => now - t.ts < 60000);
+            const cvd60s = recent60s.reduce((a, b) => a + b.delta, 0);
+            const slopeAligned = (cvd5s > 0 && cvd60s >= 0) || (cvd5s < 0 && cvd60s <= 0);
+            
+            if (slopeAligned) {
+              lastBurstRef.current = now;
+              const side = cvd5s > 0 ? 'buy' : 'sell';
+              const ev: FlowEvent = {
+                id: `${now}-${Math.random()}`,
+                type: 'DELTA_BURST',
+                sev: 'high',
+                text: `DELTA BURST ${side.toUpperCase()} CVD: $${(cvd5s / 1000).toFixed(0)}k (Hacim: $${(vol5s / 1000).toFixed(0)}k, 1D Eğim Onaylı)`,
+                ts: now,
+                side
+              };
+              setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
+            }
           }
         }
 
@@ -1188,6 +1272,7 @@ export default function Home() {
                 flowEvents={flowEvents}
                 lastPrice={lastPrice}
                 symbolInfo={symbolInfos.find((s) => s.symbol === symbol) || null}
+                activePatternStats={activePatternStats}
                 onUpdateSetting={handleUpdateSingleSetting}
                 isFullscreen={isFullscreen}
                 onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}

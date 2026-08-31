@@ -27,7 +27,7 @@ import {
   Eye,
   EyeOff
 } from 'lucide-react';
-import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent, SymbolInfo } from '@/lib/types';
+import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent, SymbolInfo, PatternStats } from '@/lib/types';
 import { bollingerBands, macd, psar, rsi, sma, vwap } from '@/lib/indicators';
 
 interface ChartTerminalProps {
@@ -45,6 +45,7 @@ interface ChartTerminalProps {
   flowEvents: FlowEvent[];
   lastPrice: number;
   symbolInfo?: SymbolInfo | null;
+  activePatternStats?: PatternStats | null;
   onUpdateSetting?: (key: keyof AppSettings, val: any) => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
@@ -89,6 +90,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   flowEvents,
   lastPrice,
   symbolInfo,
+  activePatternStats,
   onUpdateSetting,
   isFullscreen = false,
   onToggleFullscreen
@@ -111,8 +113,11 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   const macdSigRef = useRef<ISeriesApi<'Line'> | null>(null);
   const macdHistRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const markerPrimitiveRef = useRef<any>(null);
+  const mfePriceLineRef = useRef<any>(null);
+  const maePriceLineRef = useRef<any>(null);
 
   const lastBarTimeRef = useRef<number | null>(null);
+  const overlayRafRef = useRef<number | null>(null);
 
   // Overlay Canvases
   const heatmapCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -575,140 +580,243 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     settings.whaleAlerts
   ]);
 
-  // Canvas Heatmap & DOM Overlays
-  const drawOverlays = useCallback(() => {
-    if (!chartRef.current || !candleSeriesRef.current || !containerRef.current) return;
-
-    const chart = chartRef.current;
+  // Projected MFE / MAE Target Price Lines (F2-3)
+  useEffect(() => {
+    if (!candleSeriesRef.current) return;
     const series = candleSeriesRef.current;
-    const width = containerRef.current.clientWidth;
-    const height = containerRef.current.clientHeight;
 
-    // 1. Draw Liquidity Heatmap
-    if (heatmapCanvasRef.current && settings.showHeatmap) {
-      const cv = heatmapCanvasRef.current;
-      const ctx = cv.getContext('2d');
-      if (ctx) {
-        ctx.clearRect(0, 0, width, height);
+    if (mfePriceLineRef.current) {
+      try { series.removePriceLine(mfePriceLineRef.current); } catch {}
+      mfePriceLineRef.current = null;
+    }
+    if (maePriceLineRef.current) {
+      try { series.removePriceLine(maePriceLineRef.current); } catch {}
+      maePriceLineRef.current = null;
+    }
 
-        if (heatmapFrames.length > 0) {
-          const timeScale = chart.timeScale();
-          heatmapFrames.forEach((frame) => {
-            const x = timeScale.timeToCoordinate((frame.t / 1000) as Time);
-            if (x === null || x < 0 || x > width) return;
+    const latestSig = signals[0];
+    if (
+      latestSig &&
+      activePatternStats &&
+      activePatternStats.avgMfe20 > 0 &&
+      activePatternStats.avgMae20 > 0 &&
+      (Date.now() / 1000 - latestSig.ts < intervalToSeconds(interval) * 25)
+    ) {
+      const isAl = latestSig.dir === 'AL';
+      const mfePrice = isAl
+        ? latestSig.price * (1 + activePatternStats.avgMfe20 / 100)
+        : latestSig.price * (1 - activePatternStats.avgMfe20 / 100);
+      const maePrice = isAl
+        ? latestSig.price * (1 - activePatternStats.avgMae20 / 100)
+        : latestSig.price * (1 + activePatternStats.avgMae20 / 100);
 
-            const nextX = x + 10;
-            const barW = Math.max(3, nextX - x);
+      mfePriceLineRef.current = series.createPriceLine({
+        price: mfePrice,
+        color: '#10b981',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `MFE Hedef (+${activePatternStats.avgMfe20.toFixed(2)}%)`
+      });
 
-            frame.bins.forEach((bin) => {
-              const y = series.priceToCoordinate(bin.price);
-              if (y === null || y < 0 || y > height) return;
+      maePriceLineRef.current = series.createPriceLine({
+        price: maePrice,
+        color: '#ef4444',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: `MAE Risk (-${activePatternStats.avgMae20.toFixed(2)}%)`
+      });
+    }
+  }, [signals, activePatternStats, interval]);
 
-              const alpha = Math.min(0.85, Math.max(0.08, Math.log10(bin.notional + 1) / 5));
-              ctx.fillStyle =
-                bin.side === 'B'
-                  ? `rgba(38, 166, 154, ${alpha})`
-                  : `rgba(239, 83, 80, ${alpha})`;
-              ctx.fillRect(x - barW / 2, y - 1.5, barW, 3);
+  // Canvas Heatmap & DOM Overlays with Raster Binning & requestAnimationFrame (F1-5 - F1-8)
+  const drawOverlays = useCallback(() => {
+    if (overlayRafRef.current) {
+      cancelAnimationFrame(overlayRafRef.current);
+    }
+
+    overlayRafRef.current = requestAnimationFrame(() => {
+      if (!chartRef.current || !candleSeriesRef.current || !containerRef.current) return;
+
+      const chart = chartRef.current;
+      const series = candleSeriesRef.current;
+      const width = containerRef.current.clientWidth;
+      const height = containerRef.current.clientHeight;
+
+      // 1. Draw Liquidity Heatmap with (X, Y) Raster Binning
+      if (heatmapCanvasRef.current && settings.showHeatmap) {
+        const cv = heatmapCanvasRef.current;
+        if (cv.width !== width || cv.height !== height) {
+          cv.width = width;
+          cv.height = height;
+        }
+        const ctx = cv.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, width, height);
+
+          if (heatmapFrames.length > 0) {
+            const timeScale = chart.timeScale();
+            const rasterCells = new Map<string, { x: number; y: number; notional: number; buyNotional: number; sellNotional: number }>();
+
+            heatmapFrames.forEach((frame) => {
+              const x = timeScale.timeToCoordinate((frame.t / 1000) as Time);
+              if (x === null || x < 0 || x > width) return;
+              const slotX = Math.round(x / 4) * 4;
+
+              frame.bins.forEach((bin) => {
+                const y = series.priceToCoordinate(bin.price);
+                if (y === null || y < 0 || y > height) return;
+                const slotY = Math.round(y / 3) * 3;
+                const k = `${slotX}_${slotY}`;
+                const cur = rasterCells.get(k);
+                if (cur) {
+                  cur.notional += bin.notional;
+                  if (bin.side === 'B') cur.buyNotional += bin.notional;
+                  else cur.sellNotional += bin.notional;
+                } else {
+                  rasterCells.set(k, {
+                    x: slotX,
+                    y: slotY,
+                    notional: bin.notional,
+                    buyNotional: bin.side === 'B' ? bin.notional : 0,
+                    sellNotional: bin.side === 'A' ? bin.notional : 0
+                  });
+                }
+              });
             });
+
+            rasterCells.forEach((cell) => {
+              const alpha = Math.min(0.88, Math.max(0.08, Math.log10(cell.notional + 1) / 4.8));
+              const isBuy = cell.buyNotional >= cell.sellNotional;
+              ctx.fillStyle = isBuy ? `rgba(38, 166, 154, ${alpha})` : `rgba(239, 83, 80, ${alpha})`;
+              ctx.fillRect(cell.x - 2, cell.y - 1.5, 4, 3);
+            });
+          }
+        }
+      } else if (heatmapCanvasRef.current) {
+        const ctx = heatmapCanvasRef.current.getContext('2d');
+        if (ctx) ctx.clearRect(0, 0, width, height);
+      }
+
+      // 2. Draw DOM Ladder & Liquidity Walls with Vertical Raster Binning
+      if (domOverlayCanvasRef.current && settings.showLadder) {
+        const cv = domOverlayCanvasRef.current;
+        if (cv.width !== width || cv.height !== height) {
+          cv.width = width;
+          cv.height = height;
+        }
+        const ctx = cv.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, width, height);
+
+          const chartRight = width - 65;
+          const ladderWidth = 140;
+          const ladderLeft = chartRight - ladderWidth;
+
+          // Ladder background container
+          ctx.fillStyle = 'rgba(13, 17, 23, 0.48)';
+          ctx.fillRect(ladderLeft, 0, ladderWidth, height);
+          ctx.strokeStyle = 'rgba(42, 48, 56, 0.5)';
+          ctx.beginPath();
+          ctx.moveTo(ladderLeft, 0);
+          ctx.lineTo(ladderLeft, height);
+          ctx.stroke();
+
+          const askSlots = new Map<number, { vol: number; price: number }>();
+          const bidSlots = new Map<number, { vol: number; price: number }>();
+          let maxVol = 1;
+
+          asksBook.forEach((vol, price) => {
+            const y = series.priceToCoordinate(price);
+            if (y === null || y < 0 || y > height) return;
+            const slotY = Math.round(y / 2.5) * 2.5;
+            const cur = askSlots.get(slotY) || { vol: 0, price };
+            cur.vol += vol;
+            askSlots.set(slotY, cur);
+            if (cur.vol > maxVol) maxVol = cur.vol;
           });
-        }
-      }
-    } else if (heatmapCanvasRef.current) {
-      const ctx = heatmapCanvasRef.current.getContext('2d');
-      if (ctx) ctx.clearRect(0, 0, width, height);
-    }
 
-    // 2. Draw DOM Ladder & Liquidity Walls
-    if (domOverlayCanvasRef.current && settings.showLadder) {
-      const cv = domOverlayCanvasRef.current;
-      const ctx = cv.getContext('2d');
-      if (ctx) {
-        ctx.clearRect(0, 0, width, height);
+          bidsBook.forEach((vol, price) => {
+            const y = series.priceToCoordinate(price);
+            if (y === null || y < 0 || y > height) return;
+            const slotY = Math.round(y / 2.5) * 2.5;
+            const cur = bidSlots.get(slotY) || { vol: 0, price };
+            cur.vol += vol;
+            bidSlots.set(slotY, cur);
+            if (cur.vol > maxVol) maxVol = cur.vol;
+          });
 
-        const chartRight = width - 65;
-        const ladderWidth = 140;
-        const ladderLeft = chartRight - ladderWidth;
+          // Draw Asks (Red)
+          askSlots.forEach(({ vol }, slotY) => {
+            const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
+            const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
 
-        // Ladder background
-        ctx.fillStyle = 'rgba(13, 17, 23, 0.45)';
-        ctx.fillRect(ladderLeft, 0, ladderWidth, height);
-        ctx.strokeStyle = 'rgba(42, 48, 56, 0.5)';
-        ctx.beginPath();
-        ctx.moveTo(ladderLeft, 0);
-        ctx.lineTo(ladderLeft, height);
-        ctx.stroke();
+            ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.65)' : 'rgba(239, 83, 80, 0.28)';
+            ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
-        let maxVol = 1;
-        bidsBook.forEach((v) => { if (v > maxVol) maxVol = v; });
-        asksBook.forEach((v) => { if (v > maxVol) maxVol = v; });
+            if (isWall) {
+              ctx.strokeStyle = 'rgba(239, 83, 80, 0.9)';
+              ctx.lineWidth = 1;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(0, slotY);
+              ctx.lineTo(chartRight, slotY);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+          });
 
-        // Draw Asks (Red)
-        asksBook.forEach((vol, price) => {
-          const y = series.priceToCoordinate(price);
-          if (y === null || y < 0 || y > height) return;
+          // Draw Bids (Green)
+          bidSlots.forEach(({ vol }, slotY) => {
+            const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
+            const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
 
-          const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
-          const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
+            ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.65)' : 'rgba(38, 166, 154, 0.28)';
+            ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
-          ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.55)' : 'rgba(239, 83, 80, 0.25)';
-          ctx.fillRect(chartRight - barLen, y - 1, barLen, 2.5);
+            if (isWall) {
+              ctx.strokeStyle = 'rgba(38, 166, 154, 0.9)';
+              ctx.lineWidth = 1;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(0, slotY);
+              ctx.lineTo(chartRight, slotY);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+          });
 
-          if (isWall) {
-            ctx.strokeStyle = 'rgba(239, 83, 80, 0.9)';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(chartRight, y);
-            ctx.stroke();
-            ctx.setLineDash([]);
-          }
-        });
-
-        // Draw Bids (Green)
-        bidsBook.forEach((vol, price) => {
-          const y = series.priceToCoordinate(price);
-          if (y === null || y < 0 || y > height) return;
-
-          const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
-          const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
-
-          ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.55)' : 'rgba(38, 166, 154, 0.25)';
-          ctx.fillRect(chartRight - barLen, y - 1, barLen, 2.5);
-
-          if (isWall) {
-            ctx.strokeStyle = 'rgba(38, 166, 154, 0.9)';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([3, 3]);
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(chartRight, y);
-            ctx.stroke();
-            ctx.setLineDash([]);
-          }
-        });
-
-        // Current Spread Ray
-        if (flowSnapshot.bestBid && flowSnapshot.bestAsk) {
-          const bidY = series.priceToCoordinate(flowSnapshot.bestBid);
-          const askY = series.priceToCoordinate(flowSnapshot.bestAsk);
-          if (bidY !== null && askY !== null) {
-            const my = (bidY + askY) / 2;
-            const rayLeft = chartRight - 35;
-            ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([2, 2]);
-            ctx.beginPath();
-            ctx.moveTo(rayLeft, my);
-            ctx.lineTo(chartRight, my);
-            ctx.stroke();
-            ctx.setLineDash([]);
+          // Current Spread Ray
+          if (flowSnapshot.bestBid && flowSnapshot.bestAsk) {
+            const bidY = series.priceToCoordinate(flowSnapshot.bestBid);
+            const askY = series.priceToCoordinate(flowSnapshot.bestAsk);
+            if (bidY !== null && askY !== null) {
+              const my = (bidY + askY) / 2;
+              const rayLeft = chartRight - 35;
+              ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+              ctx.lineWidth = 1;
+              ctx.setLineDash([2, 2]);
+              ctx.beginPath();
+              ctx.moveTo(rayLeft, my);
+              ctx.lineTo(chartRight, my);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
           }
         }
       }
-    }
+    });
   }, [bidsBook, asksBook, heatmapFrames, settings, flowSnapshot]);
+
+  // Clean up RAF on unmount
+  useEffect(() => {
+    return () => {
+      if (overlayRafRef.current) {
+        cancelAnimationFrame(overlayRafRef.current);
+      }
+    };
+  }, []);
 
   // Subscribe chart timeScale to redraw canvas overlays on pan/zoom
   useEffect(() => {
