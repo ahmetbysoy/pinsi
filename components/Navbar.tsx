@@ -28,6 +28,8 @@ interface NavbarProps {
   fundingRate: number | null;
   nextFundingTime: number | null;
   wsConnected: boolean;
+  marketConnected?: boolean;
+  depthConnected?: boolean;
   wsMessage?: string;
 }
 
@@ -44,6 +46,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   fundingRate,
   nextFundingTime,
   wsConnected,
+  marketConnected = true,
+  depthConnected = true,
   wsMessage
 }) => {
   const [searchOpen, setSearchOpen] = useState(false);
@@ -105,9 +109,16 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
           <div className="hidden md:block">
             <div className="text-xs font-bold tracking-wider text-slate-200">FUTURES PRO</div>
-            <div className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
-              <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
-              {wsConnected ? 'LIVE FEED' : 'OFFLINE'}
+            <div className="text-[10px] font-mono flex items-center gap-2">
+              <span className="flex items-center gap-1">
+                <span className={`w-1.5 h-1.5 rounded-full ${marketConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
+                <span className={marketConnected ? 'text-emerald-400' : 'text-red-400'}>MKT</span>
+              </span>
+              <span className="text-slate-600">|</span>
+              <span className="flex items-center gap-1">
+                <span className={`w-1.5 h-1.5 rounded-full ${depthConnected ? 'bg-cyan-400 animate-pulse' : 'bg-red-500'}`} />
+                <span className={depthConnected ? 'text-cyan-400' : 'text-red-400'}>DOM</span>
+              </span>
             </div>
           </div>
         </div>

@@ -22,6 +22,7 @@ import {
   PatternEvent,
   PatternStats,
   SignalLogEntry,
+  SymbolInfo,
   Ticker24h,
   TradeEvent
 } from '@/lib/types';
@@ -110,6 +111,7 @@ export default function Home() {
   const [interval, setInterval] = useState<string>('5m');
   const [activeView, setActiveView] = useState<'chart' | 'signal' | 'scanner' | 'pool' | 'settings'>('chart');
   const [symbols, setSymbols] = useState<string[]>([]);
+  const [symbolInfos, setSymbolInfos] = useState<SymbolInfo[]>([]);
   const [tickers, setTickers] = useState<Ticker24h[]>([]);
   const [favs, setFavs] = useState<string[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -122,6 +124,8 @@ export default function Home() {
   const [nextFundingTime, setNextFundingTime] = useState<number | null>(null);
   const [openInterest, setOpenInterest] = useState<number | null>(null);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [marketConnected, setMarketConnected] = useState<boolean>(false);
+  const [depthConnected, setDepthConnected] = useState<boolean>(false);
   const [wsMessage, setWsMessage] = useState<string>('');
 
   // Flow Data Arrays
@@ -342,6 +346,7 @@ export default function Home() {
     const loadMarketData = async () => {
       try {
         const [infos, tickerList] = await Promise.all([fetchExchangeInfo(), fetch24hTickers()]);
+        setSymbolInfos(infos);
         setSymbols(infos.map((i) => i.symbol));
         setTickers(tickerList);
       } catch (e) {
@@ -646,6 +651,23 @@ export default function Home() {
         reasons.push(`Short squeeze cascade: $${(snap.shortLiq60 / 1000).toFixed(0)}k short liq tetiklendi.`);
       }
 
+      // Absorption & Flow Detector Confluence
+      const recentAbsorption = flowEvents.find((e) => e.type === 'ABSORPTION' && Date.now() - e.ts < 20000);
+      if (recentAbsorption) {
+        if ((dir === 'AL' && recentAbsorption.side === 'buy') || (dir === 'SAT' && recentAbsorption.side === 'sell')) {
+          score += 10;
+          reasons.push(`Duvar Absorption teyidi: Pasif ${recentAbsorption.side?.toUpperCase()} emilim gücü sinyali destekliyor.`);
+        }
+      }
+
+      const recentBurst = flowEvents.find((e) => e.type === 'DELTA_BURST' && Date.now() - e.ts < 15000);
+      if (recentBurst) {
+        if ((dir === 'AL' && recentBurst.side === 'buy') || (dir === 'SAT' && recentBurst.side === 'sell')) {
+          score += 8;
+          reasons.push(`Delta Burst momentum: Agresif ${recentBurst.side?.toUpperCase()} patlaması arkamızda.`);
+        }
+      }
+
       // Open Interest Dynamic
       if (snap.oiChangePct < -0.25 && snap.takerSpike) {
         score += dir === 'SAT' ? 8 : 4;
@@ -675,7 +697,7 @@ export default function Home() {
         metrics: snap
       };
     },
-    [computeFlowSnapshot]
+    [computeFlowSnapshot, flowEvents]
   );
 
   // 6. Signal Trigger Engine (Katman 1 MA/SAR) + Live Pattern Pool Engine
@@ -953,6 +975,33 @@ export default function Home() {
             setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
           }
         }
+
+        // 4. Absorption Detector (High volume/CVD with minimal price movement < 0.08%)
+        if (now - lastAbsorbRef.current > 6000) {
+          const recent8s = tradesRef.current.filter((t) => now - t.ts < 8000);
+          if (recent8s.length >= 10) {
+            const vol8s = recent8s.reduce((a, b) => a + b.notional, 0);
+            const cvd8s = recent8s.reduce((a, b) => a + b.delta, 0);
+            const prices = recent8s.map((t) => t.price);
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            const spreadPct = minP > 0 ? (maxP - minP) / minP : 0;
+
+            if (vol8s > whaleMin * 2.2 && Math.abs(cvd8s) > whaleMin * 0.8 && spreadPct < 0.0008) {
+              lastAbsorbRef.current = now;
+              const absorbSide = cvd8s > 0 ? 'sell' : 'buy'; // If buyers are aggressive but price won't rise, passive sellers absorb
+              const ev: FlowEvent = {
+                id: `${now}-${Math.random()}`,
+                type: 'ABSORPTION',
+                sev: 'high',
+                text: `ABSORPTION: Pasif ${absorbSide.toUpperCase()} Duvarı $${(vol8s / 1000).toFixed(0)}k emdi (Fiyat kayması <%0.08)`,
+                ts: now,
+                side: absorbSide
+              };
+              setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
+            }
+          }
+        }
       },
       onMarkPrice: (mark) => {
         setMarkPrice(mark.markPrice);
@@ -1067,6 +1116,8 @@ export default function Home() {
       },
       onStatusChange: (st) => {
         setWsConnected(st.connected);
+        setMarketConnected(st.marketConnected);
+        setDepthConnected(st.depthConnected);
         setWsMessage(st.message || '');
       }
     });
@@ -1105,6 +1156,8 @@ export default function Home() {
           fundingRate={fundingRate}
           nextFundingTime={nextFundingTime}
           wsConnected={wsConnected}
+          marketConnected={marketConnected}
+          depthConnected={depthConnected}
           wsMessage={wsMessage}
         />
       )}
@@ -1134,6 +1187,7 @@ export default function Home() {
                 liquidations={liquidations}
                 flowEvents={flowEvents}
                 lastPrice={lastPrice}
+                symbolInfo={symbolInfos.find((s) => s.symbol === symbol) || null}
                 onUpdateSetting={handleUpdateSingleSetting}
                 isFullscreen={isFullscreen}
                 onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}

@@ -2,6 +2,8 @@ import { Candle, FlowEvent, FlowSnapshot, LiquidationEvent, SymbolInfo, Ticker24
 
 export const REST_BASE = 'https://fapi.binance.com';
 export const WS_BASE = 'wss://fstream.binance.com';
+export const WS_MARKET_BASE = 'wss://fstream.binance.com/market';
+export const WS_PUBLIC_BASE = 'wss://fstream.binance.com/public';
 
 function fetchWithTimeout(url: string, timeoutMs: number = 8000): Promise<Response> {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -121,27 +123,51 @@ export async function fetchDepthSnapshot(symbol: string, limit: number = 1000): 
   };
 }
 
+export interface StreamStatus {
+  connected: boolean;
+  marketConnected: boolean;
+  depthConnected: boolean;
+  message?: string;
+}
+
 export interface StreamCallbacks {
   onKline?: (candle: Candle, isClosed: boolean) => void;
   onTrade?: (trade: TradeEvent) => void;
   onMarkPrice?: (mark: { markPrice: number; fundingRate: number; nextFundingTime: number }) => void;
   onLiquidation?: (liq: LiquidationEvent) => void;
   onDepthUpdate?: (depth: { bids: Map<number, number>; asks: Map<number, number>; lastUpdateId: number }) => void;
-  onStatusChange?: (status: { connected: boolean; message?: string }) => void;
+  onStatusChange?: (status: StreamStatus) => void;
 }
 
+/**
+ * Binance Futures Routed WebSocket Client (2026+ Architecture)
+ * - Market Stream: wss://fstream.binance.com/market/stream?streams=... (kline, aggTrade, markPrice, forceOrder)
+ * - Public Stream: wss://fstream.binance.com/public/ws/... (depth@100ms + snapshot diff sync)
+ */
 export class BinanceStreamClient {
-  private ws: WebSocket | null = null;
   private symbol: string = 'BTCUSDT';
   private interval: string = '5m';
   private callbacks: StreamCallbacks = {};
   private active = false;
-  private retryCount = 0;
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private watchdogTimer: NodeJS.Timeout | null = null;
-  private lastMessageTime = 0;
 
-  // Orderbook state
+  // Sockets
+  private marketWs: WebSocket | null = null;
+  private publicWs: WebSocket | null = null;
+
+  // Connection tracking & timers
+  private marketConnected = false;
+  private depthConnected = false;
+  private marketRetry = 0;
+  private publicRetry = 0;
+  private marketReconnectTimer: NodeJS.Timeout | null = null;
+  private publicReconnectTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private marketLastMsg = 0;
+  private publicLastMsg = 0;
+  private marketConnectTime = 0;
+  private publicConnectTime = 0;
+
+  // Depth Sync State
   public bidsBook = new Map<number, number>();
   public asksBook = new Map<number, number>();
   public depthSynced = false;
@@ -173,86 +199,132 @@ export class BinanceStreamClient {
 
   public start() {
     this.active = true;
-    this.connect();
+    this.connectMarket();
+    this.connectPublic();
     this.startWatchdog();
   }
 
   public stop() {
     this.active = false;
-    this.cleanupSocket();
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.cleanupMarket();
+    this.cleanupPublic();
+    if (this.marketReconnectTimer) clearTimeout(this.marketReconnectTimer);
+    if (this.publicReconnectTimer) clearTimeout(this.publicReconnectTimer);
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     this.depthSynced = false;
     this.depthBuffer = [];
   }
 
   public reconnect() {
-    this.cleanupSocket();
+    this.cleanupMarket();
+    this.cleanupPublic();
     this.depthSynced = false;
     this.depthBuffer = [];
     this.bidsBook.clear();
     this.asksBook.clear();
-    this.connect();
+    this.marketRetry = 0;
+    this.publicRetry = 0;
+    this.connectMarket();
+    this.connectPublic();
   }
 
-  private cleanupSocket() {
-    if (this.ws) {
-      this.ws.onopen = null;
-      this.ws.onclose = null;
-      this.ws.onerror = null;
-      this.ws.onmessage = null;
-      try {
-        this.ws.close();
-      } catch {}
-      this.ws = null;
-    }
+  private notifyStatus(msg?: string) {
+    const isConn = this.marketConnected && this.depthConnected;
+    const fallbackMsg = isConn
+      ? 'Bağlandı (Market✓ | Depth✓)'
+      : this.marketConnected
+        ? 'Market bağlı, Depth bekleniyor...'
+        : this.depthConnected
+          ? 'Depth bağlı, Market bekleniyor...'
+          : 'Bağlanıyor...';
+
+    this.callbacks.onStatusChange?.({
+      connected: isConn || this.marketConnected,
+      marketConnected: this.marketConnected,
+      depthConnected: this.depthConnected,
+      message: msg || fallbackMsg
+    });
   }
 
+  // --- Watchdog & 23h proactive reconnect ---
   private startWatchdog() {
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     this.watchdogTimer = setInterval(() => {
       if (!this.active) return;
       const now = Date.now();
-      if (this.ws && this.lastMessageTime > 0 && now - this.lastMessageTime > 35000) {
-        console.warn('[BinanceStream] Watchdog timeout, reconnecting...');
-        this.reconnect();
+
+      // Market watchdog (30s idle)
+      if (this.marketWs && this.marketLastMsg > 0 && now - this.marketLastMsg > 30000) {
+        console.warn('[MarketWS] Idle timeout, reconnecting...');
+        this.connectMarket();
+      }
+
+      // Public depth watchdog (30s idle)
+      if (this.publicWs && this.publicLastMsg > 0 && now - this.publicLastMsg > 30000) {
+        console.warn('[PublicDepthWS] Idle timeout, reconnecting...');
+        this.connectPublic();
+      }
+
+      // 23-hour proactive connection refresh (Binance 24h hard disconnect avoidance)
+      const TWENTY_THREE_HOURS = 23 * 60 * 60 * 1000;
+      if (this.marketConnectTime > 0 && now - this.marketConnectTime > TWENTY_THREE_HOURS) {
+        console.info('[MarketWS] 23h proactive refresh');
+        this.connectMarket();
+      }
+      if (this.publicConnectTime > 0 && now - this.publicConnectTime > TWENTY_THREE_HOURS) {
+        console.info('[PublicDepthWS] 23h proactive refresh');
+        this.connectPublic();
       }
     }, 10000);
   }
 
-  private connect() {
+  // --- Market Stream: Kline + AggTrade + MarkPrice + ForceOrder ---
+  private cleanupMarket() {
+    if (this.marketWs) {
+      this.marketWs.onopen = null;
+      this.marketWs.onclose = null;
+      this.marketWs.onerror = null;
+      this.marketWs.onmessage = null;
+      try {
+        this.marketWs.close();
+      } catch {}
+      this.marketWs = null;
+    }
+    this.marketConnected = false;
+  }
+
+  private connectMarket() {
     if (!this.active) return;
-    this.cleanupSocket();
+    this.cleanupMarket();
 
     const sym = this.symbol.toLowerCase();
     const streams = [
       `${sym}@kline_${this.interval}`,
       `${sym}@aggTrade`,
       `${sym}@markPrice@1s`,
-      `${sym}@depth@100ms`,
       `!forceOrder@arr`
     ].join('/');
 
-    const url = `${WS_BASE}/stream?streams=${streams}`;
-    this.callbacks.onStatusChange?.({ connected: false, message: 'Bağlanıyor...' });
+    const url = `${WS_MARKET_BASE}/stream?streams=${streams}`;
+    this.notifyStatus('Market bağlanıyor...');
 
-    const gen = ++this.syncGen;
     try {
-      this.ws = new WebSocket(url);
-    } catch (e) {
-      this.scheduleReconnect();
+      this.marketWs = new WebSocket(url);
+    } catch {
+      this.scheduleMarketReconnect();
       return;
     }
 
-    this.ws.onopen = () => {
-      this.retryCount = 0;
-      this.lastMessageTime = Date.now();
-      this.callbacks.onStatusChange?.({ connected: true, message: 'Bağlandı' });
-      this.initDepthSync(gen);
+    this.marketWs.onopen = () => {
+      this.marketRetry = 0;
+      this.marketLastMsg = Date.now();
+      this.marketConnectTime = Date.now();
+      this.marketConnected = true;
+      this.notifyStatus();
     };
 
-    this.ws.onmessage = (ev) => {
-      this.lastMessageTime = Date.now();
+    this.marketWs.onmessage = (ev) => {
+      this.marketLastMsg = Date.now();
       let payload: any;
       try {
         payload = JSON.parse(ev.data);
@@ -314,29 +386,103 @@ export class BinanceStreamClient {
           };
           this.callbacks.onLiquidation?.(liq);
         }
-      } else if (eventType === 'depthUpdate' && data.s === this.symbol) {
-        this.handleDepthMessage(data, gen);
       }
     };
 
-    this.ws.onclose = () => {
-      this.callbacks.onStatusChange?.({ connected: false, message: 'Koptu, tekrar deneniyor...' });
-      this.scheduleReconnect();
+    this.marketWs.onclose = () => {
+      this.marketConnected = false;
+      this.notifyStatus('Market koptu, tekrar deneniyor...');
+      this.scheduleMarketReconnect();
     };
 
-    this.ws.onerror = () => {
+    this.marketWs.onerror = () => {
       try {
-        this.ws?.close();
+        this.marketWs?.close();
       } catch {}
     };
   }
 
-  private scheduleReconnect() {
+  private scheduleMarketReconnect() {
     if (!this.active) return;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    const delay = Math.min(25000, 1000 * Math.pow(1.6, this.retryCount++));
-    this.reconnectTimer = setTimeout(() => {
-      this.connect();
+    if (this.marketReconnectTimer) clearTimeout(this.marketReconnectTimer);
+    const delay = Math.min(25000, 1000 * Math.pow(1.5, this.marketRetry++));
+    this.marketReconnectTimer = setTimeout(() => {
+      this.connectMarket();
+    }, delay);
+  }
+
+  // --- Public Stream: Depth 100ms + Snapshot Diff Sync ---
+  private cleanupPublic() {
+    if (this.publicWs) {
+      this.publicWs.onopen = null;
+      this.publicWs.onclose = null;
+      this.publicWs.onerror = null;
+      this.publicWs.onmessage = null;
+      try {
+        this.publicWs.close();
+      } catch {}
+      this.publicWs = null;
+    }
+    this.depthConnected = false;
+  }
+
+  private connectPublic() {
+    if (!this.active) return;
+    this.cleanupPublic();
+
+    const sym = this.symbol.toLowerCase();
+    const url = `${WS_PUBLIC_BASE}/ws/${sym}@depth@100ms`;
+
+    const gen = ++this.syncGen;
+    try {
+      this.publicWs = new WebSocket(url);
+    } catch {
+      this.schedulePublicReconnect();
+      return;
+    }
+
+    this.publicWs.onopen = () => {
+      this.publicRetry = 0;
+      this.publicLastMsg = Date.now();
+      this.publicConnectTime = Date.now();
+      this.depthConnected = true;
+      this.notifyStatus();
+      this.initDepthSync(gen);
+    };
+
+    this.publicWs.onmessage = (ev) => {
+      this.publicLastMsg = Date.now();
+      let data: any;
+      try {
+        data = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+
+      if (data.e === 'depthUpdate' && data.s === this.symbol) {
+        this.handleDepthMessage(data, gen);
+      }
+    };
+
+    this.publicWs.onclose = () => {
+      this.depthConnected = false;
+      this.notifyStatus('Depth koptu, tekrar deneniyor...');
+      this.schedulePublicReconnect();
+    };
+
+    this.publicWs.onerror = () => {
+      try {
+        this.publicWs?.close();
+      } catch {}
+    };
+  }
+
+  private schedulePublicReconnect() {
+    if (!this.active) return;
+    if (this.publicReconnectTimer) clearTimeout(this.publicReconnectTimer);
+    const delay = Math.min(25000, 1000 * Math.pow(1.5, this.publicRetry++));
+    this.publicReconnectTimer = setTimeout(() => {
+      this.connectPublic();
     }, delay);
   }
 

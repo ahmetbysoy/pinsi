@@ -27,7 +27,7 @@ import {
   Eye,
   EyeOff
 } from 'lucide-react';
-import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent } from '@/lib/types';
+import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent, SymbolInfo } from '@/lib/types';
 import { bollingerBands, macd, psar, rsi, sma, vwap } from '@/lib/indicators';
 
 interface ChartTerminalProps {
@@ -44,6 +44,7 @@ interface ChartTerminalProps {
   liquidations: LiquidationEvent[];
   flowEvents: FlowEvent[];
   lastPrice: number;
+  symbolInfo?: SymbolInfo | null;
   onUpdateSetting?: (key: keyof AppSettings, val: any) => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
@@ -87,6 +88,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   liquidations,
   flowEvents,
   lastPrice,
+  symbolInfo,
   onUpdateSetting,
   isFullscreen = false,
   onToggleFullscreen
@@ -129,11 +131,17 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     }
   };
 
-  // Memoized Indicators (Recalculate only when candles or settings change)
+  // Memoized Indicators (Recalculate only when candle count changes (new bar) or first candle time changes or settings change)
+  const candleCount = candles.length;
+  const firstCandleTime = candles[0]?.time ?? 0;
+  const lastCandleTime = candles[candles.length - 1]?.time ?? 0;
+
   const indicatorData = useMemo(() => {
     if (!candles.length) return null;
     const closes = candles.map((c) => c.close);
+    const times = candles.map((c) => c.time as Time);
     return {
+      times,
       closes,
       ma1: sma(closes, settings.ma1 || 9),
       ma2: sma(closes, settings.ma2 || 21),
@@ -144,7 +152,8 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       rsi: rsi(closes, settings.rsiPeriod || 14),
       macd: macd(closes, settings.macdFast || 12, settings.macdSlow || 26, settings.macdSignal || 9)
     };
-  }, [candles, settings]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candleCount, firstCandleTime, lastCandleTime, settings]);
 
   // Initialize Lightweight Charts
   useEffect(() => {
@@ -184,7 +193,16 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       downColor: '#ef5350',
       borderVisible: false,
       wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350'
+      wickDownColor: '#ef5350',
+      ...(symbolInfo && symbolInfo.tickSize
+        ? {
+            priceFormat: {
+              type: 'price',
+              precision: symbolInfo.pricePrecision || 2,
+              minMove: symbolInfo.tickSize
+            }
+          }
+        : {})
     });
     candleSeriesRef.current = candleSeries as any;
 
@@ -338,16 +356,37 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     });
   }, [settings.showRsi, settings.showMacd]);
 
+  // Dynamic priceFormat update whenever symbolInfo changes (precision & minMove/tickSize)
+  useEffect(() => {
+    if (!candleSeriesRef.current || !symbolInfo) return;
+    const precision = symbolInfo.pricePrecision || 2;
+    const minMove = symbolInfo.tickSize || 0.01;
+    const priceFormatOpt = {
+      type: 'price' as const,
+      precision,
+      minMove
+    };
+
+    candleSeriesRef.current.applyOptions({ priceFormat: priceFormatOpt });
+    ma1SeriesRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    ma2SeriesRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    ma3SeriesRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    sarSeriesRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    bbUpperRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    bbMidRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    bbLowerRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+    vwapSeriesRef.current?.applyOptions({ priceFormat: priceFormatOpt });
+  }, [symbolInfo]);
+
   // Reset last bar tracking ref on symbol or interval switch so full setData is triggered
   useEffect(() => {
     lastBarTimeRef.current = null;
   }, [symbol, interval]);
 
-  // Update Series Data on Candle or Settings Change
+  // 1. Candlestick & Volume Real-time Series Feed (Fast O(1) tick update on active candle)
   useEffect(() => {
-    if (!chartRef.current || !candleSeriesRef.current || !candles.length || !indicatorData) return;
+    if (!chartRef.current || !candleSeriesRef.current || !candles.length) return;
 
-    // 1. Candlesticks & Volume (Incremental update on live bar tick, full setData on bar-add or symbol/interval reset)
     const candleData: CandlestickData<Time>[] = candles.map((c) => ({
       time: c.time as Time,
       open: c.open,
@@ -382,15 +421,20 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
         volSeriesRef.current.setData(volData);
       }
     }
+  }, [candles, settings.showVol]);
 
-    const { ma1, ma2, ma3, sar, bb, vwap: vw, rsi: r, macd: m } = indicatorData;
+  // 2. Technical Indicators Feed (Only runs on new closed candle / indicatorData changes or settings toggle)
+  useEffect(() => {
+    if (!chartRef.current || !indicatorData) return;
+
+    const { times, ma1, ma2, ma3, sar, bb, vwap: vw, rsi: r, macd: m } = indicatorData;
 
     const mapLineData = (arr: (number | null)[]): LineData<Time>[] =>
-      candles
-        .map((c, i) => (arr[i] !== null ? { time: c.time as Time, value: arr[i]! } : null))
+      times
+        .map((t, i) => (arr[i] !== null ? { time: t, value: arr[i]! } : null))
         .filter((d): d is LineData<Time> => d !== null);
 
-    // 2. MAs
+    // MAs
     if (ma1SeriesRef.current) {
       ma1SeriesRef.current.applyOptions({ color: settings.ma1Color || '#e0b64c', lineWidth: (settings.ma1Width as any) || 1 });
       ma1SeriesRef.current.setData(settings.showMa ? mapLineData(ma1) : []);
@@ -404,39 +448,39 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       ma3SeriesRef.current.setData(settings.showMa ? mapLineData(ma3) : []);
     }
 
-    // 3. SAR
+    // SAR
     if (sarSeriesRef.current) {
       sarSeriesRef.current.applyOptions({ color: settings.sarColor || '#9aa4ae' });
       sarSeriesRef.current.setData(settings.showSar ? mapLineData(sar) : []);
     }
 
-    // 4. Bollinger Bands
+    // Bollinger Bands
     if (bbUpperRef.current && bbMidRef.current && bbLowerRef.current) {
       bbUpperRef.current.setData(settings.showBB ? mapLineData(bb.upper) : []);
       bbMidRef.current.setData(settings.showBB ? mapLineData(bb.mid) : []);
       bbLowerRef.current.setData(settings.showBB ? mapLineData(bb.lower) : []);
     }
 
-    // 5. VWAP
+    // VWAP
     if (vwapSeriesRef.current) {
       vwapSeriesRef.current.setData(settings.showVwap ? mapLineData(vw) : []);
     }
 
-    // 6. RSI
+    // RSI
     if (rsiSeriesRef.current) {
       rsiSeriesRef.current.setData(settings.showRsi ? mapLineData(r) : []);
     }
 
-    // 7. MACD
+    // MACD
     if (macdLineRef.current && macdSigRef.current && macdHistRef.current) {
       macdLineRef.current.setData(settings.showMacd ? mapLineData(m.line) : []);
       macdSigRef.current.setData(settings.showMacd ? mapLineData(m.signal) : []);
       const histData: HistogramData<Time>[] = [];
       if (settings.showMacd) {
-        candles.forEach((c, i) => {
+        times.forEach((t, i) => {
           if (m.hist[i] !== null) {
             histData.push({
-              time: c.time as Time,
+              time: t,
               value: m.hist[i]!,
               color: m.hist[i]! >= 0 ? 'rgba(38, 166, 154, 0.6)' : 'rgba(239, 83, 80, 0.6)'
             });
@@ -445,7 +489,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       }
       macdHistRef.current.setData(histData);
     }
-  }, [candles, settings, indicatorData]);
+  }, [indicatorData, settings]);
 
   // Markers: Signals + Liquidations + Whale Events (Separate effect - updates on events, not every tick)
   useEffect(() => {
@@ -478,10 +522,10 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       });
     }
 
-    // Whale / Flow Events (WHALE, SWEEP, DELTA_BURST, SPOOF)
+    // Whale / Flow Events (WHALE, SWEEP, DELTA_BURST, ABSORPTION, SPOOF)
     if (settings.whaleAlerts) {
       flowEvents
-        .filter((e) => e.type === 'WHALE' || e.type === 'SWEEP' || e.type === 'DELTA_BURST' || e.type === 'SPOOF')
+        .filter((e) => e.type === 'WHALE' || e.type === 'SWEEP' || e.type === 'DELTA_BURST' || e.type === 'ABSORPTION' || e.type === 'SPOOF')
         .slice(-15)
         .forEach((w) => {
           const isBuy = w.side === 'buy';
@@ -491,13 +535,22 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
             color:
               w.type === 'SPOOF'
                 ? '#ec4899'
-                : w.type === 'DELTA_BURST'
-                  ? '#a855f7'
-                  : isBuy
-                    ? '#10b981'
-                    : '#f59e0b',
+                : w.type === 'ABSORPTION'
+                  ? '#06b6d4'
+                  : w.type === 'DELTA_BURST'
+                    ? '#a855f7'
+                    : isBuy
+                      ? '#10b981'
+                      : '#f59e0b',
             shape: w.type === 'SPOOF' ? 'circle' : 'square',
-            text: w.type === 'SPOOF' ? '👻SPOOF' : w.type === 'DELTA_BURST' ? '💥BURST' : `🐋${w.type}`
+            text:
+              w.type === 'SPOOF'
+                ? '👻SPOOF'
+                : w.type === 'ABSORPTION'
+                  ? '🛡️ABSORB'
+                  : w.type === 'DELTA_BURST'
+                    ? '💥BURST'
+                    : `🐋${w.type}`
           });
         });
     }
