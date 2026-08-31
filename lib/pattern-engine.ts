@@ -169,6 +169,24 @@ export async function dbIndexGet<T>(store: string, index: string, key: IDBValidK
   return reqP(s.index(index).get(key));
 }
 
+export function intervalToSeconds(tf: string): number {
+  const map: Record<string, number> = {
+    '1m': 60,
+    '3m': 180,
+    '5m': 300,
+    '15m': 900,
+    '30m': 1800,
+    '1h': 3600,
+    '2h': 7200,
+    '4h': 14400,
+    '6h': 21600,
+    '8h': 28800,
+    '12h': 43200,
+    '1d': 86400
+  };
+  return map[tf] || 60;
+}
+
 export function patternPeriods(ma1: number = 9, ma2: number = 21, ma3: number = 50): [number, number, number] {
   return [
     Math.max(2, Math.round(ma1)),
@@ -377,12 +395,44 @@ export async function patternRecomputeStats(key: string, winThresholdPct: number
     regimes
   };
 
+  // Max 500 events per pool limit (F2-9)
+  if (events.length > 500 && dbInstance) {
+    const excess = events.slice(500);
+    const tx = dbInstance.transaction('events', 'readwrite');
+    const store = tx.objectStore('events');
+    for (const ex of excess) {
+      if (ex.id) store.delete(ex.id);
+    }
+  }
+
   await dbPut('poolStats', stat);
   return stat;
 }
 
 export async function patternGetStats(key: string): Promise<PatternStats | null> {
   return (await dbGet<PatternStats>('poolStats', key)) || null;
+}
+
+// Coin-vs-Global fallback (n>=30 coin stats -> coin stats, else global) (F2-4)
+export async function patternGetStatsBest(
+  coin: string,
+  timeframe: string,
+  patId: string
+): Promise<{ stats: PatternStats | null; scope: 'coin' | 'global' }> {
+  const coinKey = `${coin}:${timeframe}:${patId}`;
+  const globalKey = `${timeframe}:${patId}`;
+
+  const coinStats = await patternGetStats(coinKey);
+  if (coinStats && coinStats.n >= 30) {
+    return { stats: coinStats, scope: 'coin' };
+  }
+
+  const globalStats = await patternGetStats(globalKey);
+  if (globalStats) {
+    return { stats: globalStats, scope: 'global' };
+  }
+
+  return { stats: coinStats || null, scope: coinStats ? 'coin' : 'global' };
 }
 
 export async function patternBackfillFromCandles(

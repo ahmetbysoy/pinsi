@@ -1,1 +1,66 @@
 @import "tailwindcss";
+
+@layer base {
+  :root {
+    --color-bg: #0b0e14;
+    --color-panel: #12161f;
+    --color-panel-2: #171c28;
+    --color-edge: #232a37;
+    --color-edge-soft: #1b212d;
+    --color-up: #22c55e;
+    --color-down: #ef4444;
+    --color-watch: #f5b942;
+    --color-accent: #4c8ce0;
+    --color-magenta: #e05bb0;
+    --color-cyan: #22d3ee;
+  }
+}
+
+.card-surface {
+  background: linear-gradient(180deg, #161c28, #11151e);
+  border: 1px solid #232a37;
+  border-radius: 12px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.glow-up {
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35), 0 0 24px rgba(34, 197, 94, 0.12);
+}
+
+.glow-down {
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.35), 0 0 24px rgba(239, 68, 68, 0.12);
+}
+
+@keyframes flashUp {
+  0% { background-color: rgba(34, 197, 94, 0.25); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flashDown {
+  0% { background-color: rgba(239, 68, 68, 0.25); }
+  100% { background-color: transparent; }
+}
+
+.flash-up {
+  animation: flashUp 0.5s ease-out;
+}
+
+.flash-down {
+  animation: flashDown 0.5s ease-out;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border-width: 1px;
+}
+
+.dot-pulse {
+  animation: pulse 1.6s ease-in-out infinite;
+}

@@ -37,9 +37,11 @@ import {
 import { generateCommentary } from '@/lib/commentary';
 import {
   initPatternDB,
+  intervalToSeconds,
   patternContext,
   patternCrossesAt,
   patternGetStats,
+  patternGetStatsBest,
   patternOutcome,
   patternResolveSar,
   patternBackfillFromCandles,
@@ -208,6 +210,8 @@ export default function Home() {
   const lastAbsorbRef = useRef<number>(0);
   const lastBurstRef = useRef<number>(0);
   const lastDepthStateRef = useRef<number>(0);
+  const lastRecordedEventTimeRef = useRef<number>(0);
+  const lastRecordedPatIdRef = useRef<string>('');
   const prevWallsRef = useRef<Map<number, { notional: number; ts: number; side: 'B' | 'A' }>>(new Map());
   const pendingEngineRef = useRef<{
     dir: 'AL' | 'SAT';
@@ -704,6 +708,16 @@ export default function Home() {
         reasons.push(`Short squeeze cascade: $${(snap.shortLiq60 / 1000).toFixed(0)}k short liq tetiklendi.`);
       }
 
+      // Reverse Liquidation Flow Penalty (F1-9)
+      if (dir === 'SAT' && snap.shortLiq60 >= (currSettings.liqMin || 50000) * 0.75) {
+        score -= 5;
+        reasons.push('Ters likidasyon akışı (-5p): Karşı yönlü short likidasyonları satış baskısını kesebilir.');
+      }
+      if (dir === 'AL' && snap.longLiq60 >= (currSettings.liqMin || 50000) * 0.75) {
+        score -= 5;
+        reasons.push('Ters likidasyon akışı (-5p): Karşı yönlü long likidasyonları alış ivmesini kesebilir.');
+      }
+
       // Absorption & Flow Detector Confluence
       const recentAbsorption = flowEvents.find((e) => e.type === 'ABSORPTION' && Date.now() - e.ts < 20000);
       if (recentAbsorption) {
@@ -721,10 +735,23 @@ export default function Home() {
         }
       }
 
-      // Open Interest Dynamic
+      // Open Interest Dynamic & Expansion (F1-9)
       if (snap.oiChangePct < -0.25 && snap.takerSpike) {
         score += dir === 'SAT' ? 8 : 4;
         reasons.push(`OI %${snap.oiChangePct.toFixed(2)} boşaldı + taker spike.`);
+      } else if (snap.oiChangePct > 0.35) {
+        score += 4;
+        reasons.push(`Açık Pozisyon (OI) artışı (+4p): Pozisyon birikimi trendi besliyor (+%${snap.oiChangePct.toFixed(2)}).`);
+      } else if (snap.oiChangePct < -0.4 && !snap.takerSpike) {
+        score -= 2;
+        reasons.push('Açık Pozisyon azalması (-2p): Pozisyon kapanışları trendin gücünü zayıflatıyor.');
+      }
+
+      // Data Freshness Check (F1-9)
+      const lastTrade = tradesRef.current[tradesRef.current.length - 1];
+      if (lastTrade && Date.now() - lastTrade.ts > 15000) {
+        score -= 8;
+        reasons.push('Veri tazeliği uyarısı (-8p): Son 15 saniyede akış gecikmesi var.');
       }
 
       // Funding Rate Bias
@@ -887,7 +914,7 @@ export default function Home() {
                 filter
               );
               setActivePatternId(patKey);
-              const stats = await patternGetStats(`${interval}:${patKey}`);
+              const { stats } = await patternGetStatsBest(symbol, interval, patKey);
               setActivePatternStats(stats);
 
               // Evaluate Raw Flow with Pattern Pool Dual-Signal Confluence (F2-1)
@@ -900,34 +927,44 @@ export default function Home() {
               const comment = generateCommentary(p.dir, evalRes);
               setCommentary(comment);
 
-              // Record Live Pattern Event to DB for ongoing tracking & learning
+              // Record Live Pattern Event to DB (Avoid duplicate writes within 3 candles) (F2-6)
+              const intervalSec = intervalToSeconds(interval);
+              const isDuplicate =
+                lastRecordedPatIdRef.current === patKey &&
+                cs[i].time - lastRecordedEventTimeRef.current < 3 * intervalSec;
+
               const eventKey = `${symbol}_${interval}_${cs[i].time}_${patKey}`;
               const globalKey = `${interval}:${patKey}`;
               const coinKey = `${symbol}:${interval}:${patKey}`;
-              
-              const liveEvent: PatternEvent = {
-                schemaVersion: PPOOL_SCHEMA_VERSION,
-                source: 'live',
-                coin: symbol,
-                timeframe: interval,
-                timestamp: cs[i].time * 1000,
-                eventKey,
-                pair: `${currSettings.ma1}x${currSettings.ma2}`,
-                dir: p.dir === 'AL' ? 'UP' : 'DOWN',
-                filter: filter,
-                sarBucket,
-                patternId: patKey,
-                patternKey: globalKey,
-                coinPatternKey: coinKey,
-                volRegime: regimeVol,
-                trendRegime: regimeTrend,
-                regimeKey: regimeKey,
-                refClose: cs[i].close,
-                status: 'tracking',
-                createdAt: Date.now()
-              };
-              await dbAdd('events', liveEvent).catch(() => {});
-              trackingEventsRef.current.push({ eventKey, candleIdx: i, dir: p.dir });
+
+              if (!isDuplicate) {
+                lastRecordedEventTimeRef.current = cs[i].time;
+                lastRecordedPatIdRef.current = patKey;
+
+                const liveEvent: PatternEvent = {
+                  schemaVersion: PPOOL_SCHEMA_VERSION,
+                  source: 'live',
+                  coin: symbol,
+                  timeframe: interval,
+                  timestamp: cs[i].time * 1000,
+                  eventKey,
+                  pair: `${currSettings.ma1}x${currSettings.ma2}`,
+                  dir: p.dir === 'AL' ? 'UP' : 'DOWN',
+                  filter: filter,
+                  sarBucket,
+                  patternId: patKey,
+                  patternKey: globalKey,
+                  coinPatternKey: coinKey,
+                  volRegime: regimeVol,
+                  trendRegime: regimeTrend,
+                  regimeKey: regimeKey,
+                  refClose: cs[i].close,
+                  status: 'tracking',
+                  createdAt: Date.now()
+                };
+                await dbAdd('events', liveEvent).catch(() => {});
+                trackingEventsRef.current.push({ eventKey, candleIdx: i, dir: p.dir });
+              }
 
               // Push to Signal Log
               setSignals((prev) => [
@@ -991,11 +1028,12 @@ export default function Home() {
       },
       onTrade: (trade) => {
         tradesRef.current.push(trade);
-        if (tradesRef.current.length > 4000) {
-          tradesRef.current = tradesRef.current.slice(-3000);
+        const now = trade.ts;
+        const tenMinAgo = now - 600000;
+        if (tradesRef.current.length > 3000 || (tradesRef.current[0] && tradesRef.current[0].ts < tenMinAgo)) {
+          tradesRef.current = tradesRef.current.filter((t) => t.ts >= tenMinAgo);
         }
 
-        const now = trade.ts;
         const whaleMin = settingsRef.current.whaleMin || 300000;
 
         // 1. Whale Detector
@@ -1094,8 +1132,9 @@ export default function Home() {
       },
       onLiquidation: (liq) => {
         liqsRef.current.push(liq);
-        if (liqsRef.current.length > 500) {
-          liqsRef.current = liqsRef.current.slice(-400);
+        const tenMinAgo = liq.ts - 600000;
+        if (liqsRef.current.length > 250 || (liqsRef.current[0] && liqsRef.current[0].ts < tenMinAgo)) {
+          liqsRef.current = liqsRef.current.filter((l) => l.ts >= tenMinAgo);
         }
         setLiquidations((prev) => [liq, ...prev.slice(0, 50)]);
 

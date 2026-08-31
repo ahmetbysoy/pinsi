@@ -647,10 +647,6 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       // 1. Draw Liquidity Heatmap with (X, Y) Raster Binning
       if (heatmapCanvasRef.current && settings.showHeatmap) {
         const cv = heatmapCanvasRef.current;
-        if (cv.width !== width || cv.height !== height) {
-          cv.width = width;
-          cv.height = height;
-        }
         const ctx = cv.getContext('2d');
         if (ctx) {
           ctx.clearRect(0, 0, width, height);
@@ -660,7 +656,8 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
             const rasterCells = new Map<string, { x: number; y: number; notional: number; buyNotional: number; sellNotional: number }>();
 
             heatmapFrames.forEach((frame) => {
-              const x = timeScale.timeToCoordinate((frame.t / 1000) as Time);
+              // Fix H1: frame.t is already in seconds, no need to divide by 1000
+              const x = timeScale.timeToCoordinate(frame.t as Time);
               if (x === null || x < 0 || x > width) return;
               const slotX = Math.round(x / 4) * 4;
 
@@ -687,7 +684,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
             });
 
             rasterCells.forEach((cell) => {
-              const alpha = Math.min(0.88, Math.max(0.08, Math.log10(cell.notional + 1) / 4.8));
+              const alpha = Math.min(0.85, Math.max(0.08, Math.log10(cell.notional + 1) / 4.8));
               const isBuy = cell.buyNotional >= cell.sellNotional;
               ctx.fillStyle = isBuy ? `rgba(38, 166, 154, ${alpha})` : `rgba(239, 83, 80, ${alpha})`;
               ctx.fillRect(cell.x - 2, cell.y - 1.5, 4, 3);
@@ -699,91 +696,104 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
         if (ctx) ctx.clearRect(0, 0, width, height);
       }
 
-      // 2. Draw DOM Ladder & Liquidity Walls with Vertical Raster Binning
+      // 2. Draw DOM Ladder & Liquidity Walls with Compact Design (Fix H3, H4, H5)
       if (domOverlayCanvasRef.current && settings.showLadder) {
         const cv = domOverlayCanvasRef.current;
-        if (cv.width !== width || cv.height !== height) {
-          cv.width = width;
-          cv.height = height;
-        }
         const ctx = cv.getContext('2d');
         if (ctx) {
           ctx.clearRect(0, 0, width, height);
 
-          const chartRight = width - 65;
-          const ladderWidth = 140;
+          const chartRight = width - 58;
+          const ladderWidth = 52;
           const ladderLeft = chartRight - ladderWidth;
 
-          // Ladder background container
-          ctx.fillStyle = 'rgba(13, 17, 23, 0.48)';
-          ctx.fillRect(ladderLeft, 0, ladderWidth, height);
-          ctx.strokeStyle = 'rgba(42, 48, 56, 0.5)';
+          // Compact Ladder border divider
+          ctx.strokeStyle = 'rgba(42, 48, 56, 0.4)';
           ctx.beginPath();
           ctx.moveTo(ladderLeft, 0);
           ctx.lineTo(ladderLeft, height);
           ctx.stroke();
 
-          const askSlots = new Map<number, { vol: number; price: number }>();
-          const bidSlots = new Map<number, { vol: number; price: number }>();
-          let maxVol = 1;
+          const askSlots = new Map<number, { notional: number; price: number }>();
+          const bidSlots = new Map<number, { notional: number; price: number }>();
+          let maxNotional = 1000;
 
-          asksBook.forEach((vol, price) => {
+          // Fix H3: calculate notional (price * vol)
+          asksBook.forEach((qty, price) => {
             const y = series.priceToCoordinate(price);
             if (y === null || y < 0 || y > height) return;
             const slotY = Math.round(y / 2.5) * 2.5;
-            const cur = askSlots.get(slotY) || { vol: 0, price };
-            cur.vol += vol;
+            const cur = askSlots.get(slotY) || { notional: 0, price };
+            cur.notional += price * qty;
             askSlots.set(slotY, cur);
-            if (cur.vol > maxVol) maxVol = cur.vol;
+            if (cur.notional > maxNotional) maxNotional = cur.notional;
           });
 
-          bidsBook.forEach((vol, price) => {
+          bidsBook.forEach((qty, price) => {
             const y = series.priceToCoordinate(price);
             if (y === null || y < 0 || y > height) return;
             const slotY = Math.round(y / 2.5) * 2.5;
-            const cur = bidSlots.get(slotY) || { vol: 0, price };
-            cur.vol += vol;
+            const cur = bidSlots.get(slotY) || { notional: 0, price };
+            cur.notional += price * qty;
             bidSlots.set(slotY, cur);
-            if (cur.vol > maxVol) maxVol = cur.vol;
+            if (cur.notional > maxNotional) maxNotional = cur.notional;
           });
 
           // Draw Asks (Red)
-          askSlots.forEach(({ vol }, slotY) => {
-            const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
-            const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
+          askSlots.forEach(({ notional, price }, slotY) => {
+            const barLen = Math.min(ladderWidth, (notional / maxNotional) * ladderWidth);
+            const isWall = (notional / maxNotional) * 100 >= (settings.wallPct || 85) && notional >= 15000;
 
-            ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.65)' : 'rgba(239, 83, 80, 0.28)';
+            ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.75)' : 'rgba(239, 83, 80, 0.35)';
             ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
+            // Fix H5: Short glowing ray and badge instead of screen-crossing line
             if (isWall) {
-              ctx.strokeStyle = 'rgba(239, 83, 80, 0.9)';
-              ctx.lineWidth = 1;
-              ctx.setLineDash([3, 3]);
+              const rayStart = Math.max(0, chartRight - ladderWidth - 65);
+              const grad = ctx.createLinearGradient(rayStart, slotY, chartRight, slotY);
+              grad.addColorStop(0, 'rgba(239, 83, 80, 0)');
+              grad.addColorStop(1, 'rgba(239, 83, 80, 0.85)');
+              ctx.strokeStyle = grad;
+              ctx.lineWidth = 1.2;
               ctx.beginPath();
-              ctx.moveTo(0, slotY);
+              ctx.moveTo(rayStart, slotY);
               ctx.lineTo(chartRight, slotY);
               ctx.stroke();
-              ctx.setLineDash([]);
+
+              // Mini notional tag
+              ctx.font = '9px monospace';
+              ctx.fillStyle = 'rgba(239, 83, 80, 0.9)';
+              const tag = `$${(notional / 1000).toFixed(0)}k`;
+              ctx.fillText(tag, rayStart + 5, slotY - 3);
             }
           });
 
           // Draw Bids (Green)
-          bidSlots.forEach(({ vol }, slotY) => {
-            const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
-            const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
+          bidSlots.forEach(({ notional, price }, slotY) => {
+            const barLen = Math.min(ladderWidth, (notional / maxNotional) * ladderWidth);
+            const isWall = (notional / maxNotional) * 100 >= (settings.wallPct || 85) && notional >= 15000;
 
-            ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.65)' : 'rgba(38, 166, 154, 0.28)';
+            ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.75)' : 'rgba(38, 166, 154, 0.35)';
             ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
+            // Fix H5: Short glowing ray and badge instead of screen-crossing line
             if (isWall) {
-              ctx.strokeStyle = 'rgba(38, 166, 154, 0.9)';
-              ctx.lineWidth = 1;
-              ctx.setLineDash([3, 3]);
+              const rayStart = Math.max(0, chartRight - ladderWidth - 65);
+              const grad = ctx.createLinearGradient(rayStart, slotY, chartRight, slotY);
+              grad.addColorStop(0, 'rgba(38, 166, 154, 0)');
+              grad.addColorStop(1, 'rgba(38, 166, 154, 0.85)');
+              ctx.strokeStyle = grad;
+              ctx.lineWidth = 1.2;
               ctx.beginPath();
-              ctx.moveTo(0, slotY);
+              ctx.moveTo(rayStart, slotY);
               ctx.lineTo(chartRight, slotY);
               ctx.stroke();
-              ctx.setLineDash([]);
+
+              // Mini notional tag
+              ctx.font = '9px monospace';
+              ctx.fillStyle = 'rgba(38, 166, 154, 0.9)';
+              const tag = `$${(notional / 1000).toFixed(0)}k`;
+              ctx.fillText(tag, rayStart + 5, slotY - 3);
             }
           });
 
@@ -793,7 +803,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
             const askY = series.priceToCoordinate(flowSnapshot.bestAsk);
             if (bidY !== null && askY !== null) {
               const my = (bidY + askY) / 2;
-              const rayLeft = chartRight - 35;
+              const rayLeft = chartRight - 30;
               ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
               ctx.lineWidth = 1;
               ctx.setLineDash([2, 2]);
