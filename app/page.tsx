@@ -202,6 +202,7 @@ export default function Home() {
   const lastPriceRef = useRef<number>(lastPrice);
   const candlesRef = useRef<Candle[]>(candles);
   const prevOiRef = useRef<number | null>(null);
+  const latestOiRef = useRef<number | null>(null);
   const bidsBookRef = useRef<Map<number, number>>(bidsBook);
   const asksBookRef = useRef<Map<number, number>>(asksBook);
 
@@ -230,9 +231,19 @@ export default function Home() {
   const lastSweepRef = useRef<number>(0);
   const lastAbsorbRef = useRef<number>(0);
   const lastBurstRef = useRef<number>(0);
-  const lastDepthUiUpdateRef = useRef<number>(0);
+  const lastDepthStateRef = useRef<number>(0);
   const prevWallsRef = useRef<Map<number, { notional: number; ts: number; side: 'B' | 'A' }>>(new Map());
-  const pendingEngineRef = useRef<{ dir: 'AL' | 'SAT'; idx: number; flip: boolean } | null>(null);
+  const pendingEngineRef = useRef<{
+    dir: 'AL' | 'SAT';
+    idx: number;
+    flip: boolean;
+    cross?: {
+      dir: 'UP' | 'DOWN';
+      filter: 'F1' | 'F0';
+      pair: string;
+      regime: { vol: 'LOW' | 'MID' | 'HIGH'; trend: 'UP' | 'DOWN' | 'FLAT'; key: string };
+    };
+  } | null>(null);
   const trackingEventsRef = useRef<Array<{ eventKey: string; candleIdx: number; dir: 'AL' | 'SAT' }>>([]);
 
   // UI / Layout States
@@ -296,6 +307,7 @@ export default function Home() {
     pendingEngineRef.current = null;
     trackingEventsRef.current = [];
     prevOiRef.current = null;
+    latestOiRef.current = null;
     setTrades([]);
     setLiquidations([]);
     setHeatmapFrames([]);
@@ -368,20 +380,19 @@ export default function Home() {
     };
   }, [symbol, interval]);
 
-  // 3. Open Interest & Funding Rate Poller (Tracks delta between polls)
+  // 3. Open Interest & Funding Rate Poller (Tracks poll-to-poll delta)
   useEffect(() => {
     const pollOI = async () => {
       try {
         const [oi, prem] = await Promise.all([fetchOpenInterest(symbol), fetchPremiumIndex(symbol)]);
         if (oi !== null) {
-          setOpenInterest((currentPrev) => {
-            if (currentPrev !== null) {
-              prevOiRef.current = currentPrev;
-            } else if (prevOiRef.current === null) {
-              prevOiRef.current = oi;
-            }
-            return oi;
-          });
+          if (latestOiRef.current !== null) {
+            prevOiRef.current = latestOiRef.current;
+          } else if (prevOiRef.current === null) {
+            prevOiRef.current = oi; // ilk poll: karşılaştırma tabanı
+          }
+          latestOiRef.current = oi;
+          setOpenInterest(oi);
         }
         if (prem.fundingRate !== null) setFundingRate(prem.fundingRate);
         if (prem.markPrice !== null) setMarkPrice(prem.markPrice);
@@ -726,7 +737,8 @@ export default function Home() {
         pendingEngineRef.current = {
           dir: primaryCross.dir === 'UP' ? 'AL' : 'SAT',
           idx: i,
-          flip: false
+          flip: false,
+          cross: primaryCross
         };
       }
 
@@ -762,18 +774,21 @@ export default function Home() {
 
               // Query pattern stats
               const sarBucket = elapsed === 0 ? 'SAR0' : elapsed === 1 ? 'SAR1' : elapsed <= 3 ? 'SAR2-3' : 'SARX';
+              const crossInfo = p.cross;
+              const filter: 'F1' | 'F0' = crossInfo ? crossInfo.filter : 'F1';
+              const regimeVol = crossInfo ? crossInfo.regime.vol : 'MID';
+              const regimeTrend = crossInfo ? crossInfo.regime.trend : (p.dir === 'AL' ? 'UP' : 'DOWN');
+              const regimeKey = crossInfo ? crossInfo.regime.key : `MID_${p.dir === 'AL' ? 'UP' : 'DOWN'}`;
+
               const patKey = patternId(
                 `${currSettings.ma1}x${currSettings.ma2}`,
                 p.dir === 'AL' ? 'UP' : 'DOWN',
                 sarBucket,
-                'F1'
+                filter
               );
               setActivePatternId(patKey);
               const stats = await patternGetStats(`${interval}:${patKey}`);
               setActivePatternStats(stats);
-
-              // Calculate real market regime matching backfill
-              const liveRegime = patternRegimeAt(ctx, i, currSettings.ma3 || 50);
 
               // Record Live Pattern Event to DB for ongoing tracking & learning
               const eventKey = `${symbol}_${interval}_${cs[i].time}_${patKey}`;
@@ -789,14 +804,14 @@ export default function Home() {
                 eventKey,
                 pair: `${currSettings.ma1}x${currSettings.ma2}`,
                 dir: p.dir === 'AL' ? 'UP' : 'DOWN',
-                filter: 'F1',
+                filter: filter,
                 sarBucket,
                 patternId: patKey,
                 patternKey: globalKey,
                 coinPatternKey: coinKey,
-                volRegime: liveRegime.vol,
-                trendRegime: liveRegime.trend,
-                regimeKey: liveRegime.key,
+                volRegime: regimeVol,
+                trendRegime: regimeTrend,
+                regimeKey: regimeKey,
                 refClose: cs[i].close,
                 status: 'tracking',
                 createdAt: Date.now()
@@ -956,8 +971,9 @@ export default function Home() {
         asksBookRef.current = depth.asks;
 
         const now = Date.now();
-        if (now - lastDepthUiUpdateRef.current >= 200) {
-          lastDepthUiUpdateRef.current = now;
+        // React state'i 250ms'de bir yay; hesaplamalar (spoof/heatmap) her tick'te calismaya devam eder.
+        if (now - lastDepthStateRef.current >= 250) {
+          lastDepthStateRef.current = now;
           setBidsBook(new Map(depth.bids));
           setAsksBook(new Map(depth.asks));
         }

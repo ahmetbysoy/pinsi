@@ -51,6 +51,28 @@ interface ChartTerminalProps {
 
 const TFS = ['1m', '5m', '15m', '1h', '4h'];
 
+// Binance interval kisayolunu saniyeye cevirir.
+function intervalToSeconds(tf: string): number {
+  const m: Record<string, number> = {
+    '1m': 60,
+    '3m': 180,
+    '5m': 300,
+    '15m': 900,
+    '30m': 1800,
+    '1h': 3600,
+    '2h': 7200,
+    '4h': 14400,
+    '1d': 86400
+  };
+  return m[tf] || 300;
+}
+
+// Olay zamanini (ms) en yakin mum acilis saniyesine yuvarlar.
+function snapToBarTime(tsMs: number, tfSec: number): number {
+  const sec = Math.floor(tsMs / 1000);
+  return Math.floor(sec / tfSec) * tfSec;
+}
+
 export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   symbol,
   interval,
@@ -397,28 +419,12 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
 
     // Markers: Signals + Liquidations + Whale Events
     const markers: SeriesMarker<Time>[] = [];
-    const candleTimes = candles.map((c) => c.time);
-    const snapTime = (tsSec: number): Time => {
-      if (candleTimes.length === 0) return tsSec as Time;
-      if (tsSec <= candleTimes[0]) return candleTimes[0] as Time;
-      if (tsSec >= candleTimes[candleTimes.length - 1]) return candleTimes[candleTimes.length - 1] as Time;
-      let lo = 0;
-      let hi = candleTimes.length - 1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (candleTimes[mid] === tsSec) return candleTimes[mid] as Time;
-        if (candleTimes[mid] < tsSec) lo = mid + 1;
-        else hi = mid - 1;
-      }
-      const tLo = candleTimes[hi] ?? candleTimes[0];
-      const tHi = candleTimes[lo] ?? candleTimes[candleTimes.length - 1];
-      return (Math.abs(tsSec - tLo) <= Math.abs(tsSec - tHi) ? tLo : tHi) as Time;
-    };
+    const tfSec = intervalToSeconds(interval);
 
     // Signals
     signals.forEach((s) => {
       markers.push({
-        time: snapTime(s.ts),
+        time: s.ts as Time,
         position: s.dir === 'AL' ? 'belowBar' : 'aboveBar',
         color: s.dir === 'AL' ? '#26a69a' : '#ef5350',
         shape: s.dir === 'AL' ? 'arrowUp' : 'arrowDown',
@@ -430,7 +436,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     if (settings.showLiq) {
       liquidations.slice(-20).forEach((liq) => {
         markers.push({
-          time: snapTime(Math.floor(liq.ts / 1000)),
+          time: snapToBarTime(liq.ts, tfSec) as Time,
           position: liq.side === 'BUY' ? 'belowBar' : 'aboveBar',
           color: liq.side === 'BUY' ? '#ef5350' : '#26a69a',
           shape: 'circle',
@@ -439,18 +445,26 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       });
     }
 
-    // Whale Flow Events
+    // Whale / Flow Events (WHALE, SWEEP, DELTA_BURST, SPOOF)
     if (settings.whaleAlerts) {
       flowEvents
-        .filter((e) => e.type === 'WHALE' || e.type === 'SWEEP')
+        .filter((e) => e.type === 'WHALE' || e.type === 'SWEEP' || e.type === 'DELTA_BURST' || e.type === 'SPOOF')
         .slice(-15)
         .forEach((w) => {
+          const isBuy = w.side === 'buy';
           markers.push({
-            time: snapTime(Math.floor(w.ts / 1000)),
-            position: 'aboveBar',
-            color: '#f59e0b',
-            shape: 'square',
-            text: `🐋${w.type}`
+            time: snapToBarTime(w.ts, tfSec) as Time,
+            position: isBuy ? 'belowBar' : 'aboveBar',
+            color:
+              w.type === 'SPOOF'
+                ? '#ec4899'
+                : w.type === 'DELTA_BURST'
+                  ? '#a855f7'
+                  : isBuy
+                    ? '#10b981'
+                    : '#f59e0b',
+            shape: w.type === 'SPOOF' ? 'circle' : 'square',
+            text: w.type === 'SPOOF' ? '👻SPOOF' : w.type === 'DELTA_BURST' ? '💥BURST' : `🐋${w.type}`
           });
         });
     }
@@ -471,7 +485,8 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     flowEvents,
     liquidations,
     settings,
-    signals
+    signals,
+    interval
   ]);
 
   // Canvas Heatmap & DOM Overlays

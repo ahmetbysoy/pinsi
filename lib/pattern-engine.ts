@@ -489,14 +489,21 @@ export async function patternBackfillFromCandles(
 
   // Batch commit to IndexedDB
   if (eventsToAdd.length > 0 || eventsToUpdate.length > 0) {
-    const store = dbTx('events', 'readwrite');
-    if (store) {
+    if (dbInstance) {
+      const tx = dbInstance.transaction('events', 'readwrite');
+      const store = tx.objectStore('events');
       for (const ev of eventsToAdd) {
         store.add(ev);
       }
       for (const ev of eventsToUpdate) {
         store.put(ev);
       }
+      await new Promise<void>((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      }).catch((e) => {
+        console.warn('Batch commit error:', e);
+      });
     }
   }
 
