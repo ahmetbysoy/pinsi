@@ -27,7 +27,7 @@ export interface LiquidationEvent {
 
 export interface FlowEvent {
   id: string;
-  type: 'WHALE' | 'SWEEP' | 'ABSORPTION?' | 'DELTA BURST' | 'SPOOF?' | 'LIQUIDATION';
+  type: 'WHALE' | 'SWEEP' | 'ABSORPTION' | 'DELTA_BURST' | 'SPOOF' | 'LIQUIDATION';
   sev: 'high' | 'medium' | 'low';
   text: string;
   ts: number;

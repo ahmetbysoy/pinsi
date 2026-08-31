@@ -32,25 +32,27 @@ interface PatternPoolViewProps {
 export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interval }) => {
   const [statsList, setStatsList] = useState<PatternStats[]>([]);
   const [selectedPattern, setSelectedPattern] = useState<PatternStats | null>(null);
-  const [tfFilter, setTfFilter] = useState<'all' | '1m' | '5m'>('all');
+  const [tfFilter, setTfFilter] = useState<'all' | '1m' | '5m' | '15m' | '1h'>('all');
+  const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'coin'>('all');
   const [minN, setMinN] = useState<number>(0);
   const [loading, setLoading] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
 
   const loadStats = async () => {
     setLoading(true);
     try {
+      await initPatternDB();
       const allStats = await dbAll<PatternStats>('poolStats');
-      const globalStats = allStats.filter((s) => s.scope === 'global');
-      const map = new Map(globalStats.map((s) => [s.key, s]));
+      const map = new Map(allStats.map((s) => [s.key, s]));
 
       const defaultKeys: string[] = [];
-      ['1m', '5m'].forEach((tf) =>
+      ['1m', '5m', '15m', '1h'].forEach((tf) =>
         patternAllIds().forEach((pid) => defaultKeys.push(`${tf}:${pid}`))
       );
 
-      const list = defaultKeys.map((key) => {
-        return (
-          map.get(key) || {
+      const list: PatternStats[] = allStats.length > 0
+        ? allStats.slice()
+        : defaultKeys.map((key) => ({
             key,
             schemaVersion: 1,
             updatedAt: Date.now(),
@@ -70,9 +72,7 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
             weightedWinRate: 0,
             weightedAvgRet10: 0,
             regimes: {}
-          }
-        );
-      });
+          }));
 
       list.sort((a, b) => b.wilsonLower - a.wilsonLower || b.n - a.n);
       setStatsList(list);
@@ -85,29 +85,86 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
 
   useEffect(() => {
     let mounted = true;
-    const fetchStats = async () => {
+    const init = async () => {
+      setLoading(true);
       try {
         await initPatternDB();
-        const allStats = await dbAll('poolStats');
+        const allStats = await dbAll<PatternStats>('poolStats');
         if (!mounted) return;
-        const list: PatternStats[] = (allStats as PatternStats[]).slice();
+        const defaultKeys: string[] = [];
+        ['1m', '5m', '15m', '1h'].forEach((tf) =>
+          patternAllIds().forEach((pid) => defaultKeys.push(`${tf}:${pid}`))
+        );
+
+        const list: PatternStats[] = allStats.length > 0
+          ? allStats.slice()
+          : defaultKeys.map((key) => ({
+              key,
+              schemaVersion: 1,
+              updatedAt: Date.now(),
+              scope: 'global' as const,
+              timeframe: key.split(':')[0],
+              patternId: key.split(':')[1],
+              n: 0,
+              wins: 0,
+              winRate: 0,
+              wilsonLower: 0,
+              avgRet10: 0,
+              stdRet10: 0,
+              avgMfe20: 0,
+              avgMae20: 0,
+              avgRMultiple: 0,
+              medBarsToMfe: 0,
+              weightedWinRate: 0,
+              weightedAvgRet10: 0,
+              regimes: {}
+            }));
+
         list.sort((a, b) => b.wilsonLower - a.wilsonLower || b.n - a.n);
         if (mounted) {
           setStatsList(list);
           setLoading(false);
         }
-      } catch {
+      } catch (e) {
         if (mounted) setLoading(false);
       }
     };
-    fetchStats();
+    init();
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [symbol]);
+
+  const runBackfillScan = async () => {
+    setBackfilling(true);
+    try {
+      // Fetch 600 klines and backfill for current symbol
+      const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=600`);
+      if (res.ok) {
+        const raw = await res.json();
+        const cs = raw.map((k: any) => ({
+          time: Math.floor(k[0] / 1000),
+          open: parseFloat(k[1]),
+          high: parseFloat(k[2]),
+          low: parseFloat(k[3]),
+          close: parseFloat(k[4]),
+          volume: parseFloat(k[5])
+        }));
+        const { patternBackfillFromCandles } = await import('@/lib/pattern-engine');
+        await patternBackfillFromCandles(symbol, interval, cs);
+      }
+      await loadStats();
+    } catch (e) {
+      console.warn('Backfill scan error:', e);
+    } finally {
+      setBackfilling(false);
+    }
+  };
 
   const filteredList = statsList.filter((s) => {
     if (tfFilter !== 'all' && s.timeframe !== tfFilter) return false;
+    if (scopeFilter === 'global' && s.scope !== 'global') return false;
+    if (scopeFilter === 'coin' && (s.scope !== 'coin' || s.coin !== symbol)) return false;
     if (s.n < minN) return false;
     return true;
   });
@@ -199,40 +256,68 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
         </div>
 
         {/* Filters */}
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-1 bg-[#181d24] p-1 rounded-lg border border-[#262c34] text-xs">
-            <span className="text-slate-500 px-2">TF:</span>
-            {(['all', '1m', '5m'] as const).map((tf) => (
-              <button
-                key={tf}
-                onClick={() => setTfFilter(tf)}
-                className={`px-2.5 py-0.5 rounded font-mono font-bold transition-colors ${
-                  tfFilter === tf
-                    ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {tf === 'all' ? 'Hepsi' : tf}
-              </button>
-            ))}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1 bg-[#181d24] p-1 rounded-lg border border-[#262c34] text-xs">
+              <span className="text-slate-500 px-2">TF:</span>
+              {(['all', '1m', '5m', '15m', '1h'] as const).map((tf) => (
+                <button
+                  key={tf}
+                  onClick={() => setTfFilter(tf)}
+                  className={`px-2.5 py-0.5 rounded font-mono font-bold transition-colors ${
+                    tfFilter === tf
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {tf === 'all' ? 'Hepsi' : tf}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-1 bg-[#181d24] p-1 rounded-lg border border-[#262c34] text-xs">
+              <span className="text-slate-500 px-2">Kapsam:</span>
+              {(['all', 'global', 'coin'] as const).map((sc) => (
+                <button
+                  key={sc}
+                  onClick={() => setScopeFilter(sc)}
+                  className={`px-2.5 py-0.5 rounded font-mono font-bold transition-colors ${
+                    scopeFilter === sc
+                      ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {sc === 'all' ? 'Hepsi' : sc === 'global' ? 'Global' : symbol}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-1 bg-[#181d24] p-1 rounded-lg border border-[#262c34] text-xs">
+              <span className="text-slate-500 px-2">Min Örnek:</span>
+              {[0, 15, 30, 50].map((n) => (
+                <button
+                  key={n}
+                  onClick={() => setMinN(n)}
+                  className={`px-2.5 py-0.5 rounded font-mono font-bold transition-colors ${
+                    minN === n
+                      ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {n === 0 ? 'Tümü' : `${n}+`}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <div className="flex items-center gap-1 bg-[#181d24] p-1 rounded-lg border border-[#262c34] text-xs">
-            <span className="text-slate-500 px-2">Min Örnek:</span>
-            {[0, 15, 30, 50].map((n) => (
-              <button
-                key={n}
-                onClick={() => setMinN(n)}
-                className={`px-2.5 py-0.5 rounded font-mono font-bold transition-colors ${
-                  minN === n
-                    ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {n === 0 ? 'Tümü' : `${n}+`}
-              </button>
-            ))}
-          </div>
+          <button
+            onClick={runBackfillScan}
+            disabled={backfilling}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-gradient-to-r from-emerald-600/30 to-cyan-600/30 text-emerald-300 hover:text-white border border-emerald-500/40 hover:border-emerald-400 transition-all shadow-sm disabled:opacity-50"
+          >
+            <Flame className={`w-3.5 h-3.5 text-amber-400 ${backfilling ? 'animate-bounce' : ''}`} />
+            <span>{backfilling ? 'Taranıyor...' : `${symbol} (${interval}) Mumlarını Tara & Öğren`}</span>
+          </button>
         </div>
 
         {/* Main Grid: Table & Selected Detail */}

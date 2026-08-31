@@ -3,8 +3,22 @@ import { Candle, FlowEvent, FlowSnapshot, LiquidationEvent, SymbolInfo, Ticker24
 export const REST_BASE = 'https://fapi.binance.com';
 export const WS_BASE = 'wss://fstream.binance.com';
 
+function fetchWithTimeout(url: string, timeoutMs: number = 8000): Promise<Response> {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  return fetch(url, { signal: controller?.signal })
+    .then((res) => {
+      if (timer) clearTimeout(timer);
+      return res;
+    })
+    .catch((err) => {
+      if (timer) clearTimeout(timer);
+      throw err;
+    });
+}
+
 export async function fetchExchangeInfo(): Promise<SymbolInfo[]> {
-  const res = await fetch(`${REST_BASE}/fapi/v1/exchangeInfo`);
+  const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/exchangeInfo`);
   if (!res.ok) throw new Error(`exchangeInfo HTTP ${res.status}`);
   const data = await res.json();
   const symbols: SymbolInfo[] = [];
@@ -30,7 +44,7 @@ export async function fetchExchangeInfo(): Promise<SymbolInfo[]> {
 }
 
 export async function fetchKlines(symbol: string, interval: string, limit: number = 600): Promise<Candle[]> {
-  const res = await fetch(`${REST_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   if (!res.ok) throw new Error(`klines HTTP ${res.status}`);
   const data = await res.json();
   if (!Array.isArray(data)) throw new Error('Invalid klines response');
@@ -46,7 +60,7 @@ export async function fetchKlines(symbol: string, interval: string, limit: numbe
 }
 
 export async function fetch24hTickers(): Promise<Ticker24h[]> {
-  const res = await fetch(`${REST_BASE}/fapi/v1/ticker/24hr`);
+  const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/ticker/24hr`);
   if (!res.ok) throw new Error(`ticker/24hr HTTP ${res.status}`);
   const data = await res.json();
   return (data as { symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string; highPrice: string; lowPrice: string; count: number }[])
@@ -65,7 +79,7 @@ export async function fetch24hTickers(): Promise<Ticker24h[]> {
 
 export async function fetchOpenInterest(symbol: string): Promise<number | null> {
   try {
-    const res = await fetch(`${REST_BASE}/fapi/v1/openInterest?symbol=${symbol}`);
+    const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/openInterest?symbol=${symbol}`, 5000);
     if (!res.ok) return null;
     const data = await res.json();
     const val = parseFloat(data.openInterest);
@@ -77,7 +91,7 @@ export async function fetchOpenInterest(symbol: string): Promise<number | null> 
 
 export async function fetchPremiumIndex(symbol: string): Promise<{ fundingRate: number | null; markPrice: number | null; nextFundingTime: number | null }> {
   try {
-    const res = await fetch(`${REST_BASE}/fapi/v1/premiumIndex?symbol=${symbol}`);
+    const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/premiumIndex?symbol=${symbol}`, 5000);
     if (!res.ok) return { fundingRate: null, markPrice: null, nextFundingTime: null };
     const data = await res.json();
     return {
@@ -95,7 +109,7 @@ export async function fetchDepthSnapshot(symbol: string, limit: number = 1000): 
   bids: [number, number][];
   asks: [number, number][];
 }> {
-  const res = await fetch(`${REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=${limit}`);
+  const res = await fetchWithTimeout(`${REST_BASE}/fapi/v1/depth?symbol=${symbol}&limit=${limit}`, 6000);
   if (!res.ok) throw new Error(`depth snapshot HTTP ${res.status}`);
   const snap = await res.json();
   const bids: [number, number][] = (snap.bids || []).map((x: [string, string]) => [parseFloat(x[0]), parseFloat(x[1])]);
@@ -138,6 +152,10 @@ export class BinanceStreamClient {
   constructor(symbol: string, interval: string, callbacks: StreamCallbacks) {
     this.symbol = symbol.toUpperCase();
     this.interval = interval;
+    this.callbacks = callbacks;
+  }
+
+  public setCallbacks(callbacks: StreamCallbacks) {
     this.callbacks = callbacks;
   }
 
@@ -211,7 +229,6 @@ export class BinanceStreamClient {
       `${sym}@kline_${this.interval}`,
       `${sym}@aggTrade`,
       `${sym}@markPrice@1s`,
-      `${sym}@forceOrder`,
       `${sym}@depth@100ms`,
       `!forceOrder@arr`
     ].join('/');
@@ -351,6 +368,7 @@ export class BinanceStreamClient {
           return;
         }
         this.applyDepthDiff(m);
+        this.depthLastUpdate = u;
       }
 
       this.depthBuffer = [];
@@ -371,7 +389,9 @@ export class BinanceStreamClient {
   private handleDepthMessage(data: any, gen: number) {
     if (!this.depthSynced) {
       this.depthBuffer.push(data);
-      if (this.depthBuffer.length > 2000) this.depthBuffer.shift();
+      if (this.depthBuffer.length > 2000) {
+        this.depthBuffer = this.depthBuffer.slice(-1500);
+      }
       return;
     }
 

@@ -1,7 +1,9 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { Navbar } from '@/components/Navbar';
+import { BottomToolbar } from '@/components/BottomToolbar';
 import { ChartTerminal } from '@/components/ChartTerminal';
 import { FlowMetricsPanel } from '@/components/FlowMetricsPanel';
 import { SignalCard } from '@/components/SignalCard';
@@ -17,6 +19,7 @@ import {
   FlowSnapshot,
   HeatmapFrame,
   LiquidationEvent,
+  PatternEvent,
   PatternStats,
   SignalLogEntry,
   Ticker24h,
@@ -38,14 +41,15 @@ import {
   patternGetStats,
   patternOutcome,
   patternResolveSar,
-  dbAdd,
-  dbIndexGet,
-  dbPut,
-  dbAll,
-  dbIndexAll,
+  patternBackfillFromCandles,
   patternRecomputeStats,
-  patternPeriods,
-  patternId
+  patternId,
+  dbAdd,
+  dbGet,
+  dbPut,
+  dbIndexGet,
+  dbAll,
+  PPOOL_SCHEMA_VERSION
 } from '@/lib/pattern-engine';
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -70,9 +74,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   whaleAlerts: true,
   whaleMin: 300000,
   wallPct: 90,
-  showBB: true,
-  showRsi: true,
-  showMacd: true,
+  showBB: false,
+  showRsi: false,
+  showMacd: false,
   showVwap: true,
   bbPeriod: 20,
   bbStd: 2,
@@ -144,7 +148,6 @@ export default function Home() {
   const [markPrice, setMarkPrice] = useState<number | null>(null);
   const [nextFundingTime, setNextFundingTime] = useState<number | null>(null);
   const [openInterest, setOpenInterest] = useState<number | null>(null);
-  const [prevOi, setPrevOi] = useState<number | null>(null);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [wsMessage, setWsMessage] = useState<string>('');
 
@@ -193,7 +196,31 @@ export default function Home() {
   const [activePatternStats, setActivePatternStats] = useState<PatternStats | null>(null);
   const [activePatternId, setActivePatternId] = useState<string | null>(null);
 
-  // Refs for high-speed streaming without state closure traps
+  // Stable references to prevent WebSocket reconnect storms
+  const settingsRef = useRef<AppSettings>(settings);
+  const lastPriceRef = useRef<number>(lastPrice);
+  const candlesRef = useRef<Candle[]>(candles);
+  const prevOiRef = useRef<number | null>(null);
+  const bidsBookRef = useRef<Map<number, number>>(bidsBook);
+  const asksBookRef = useRef<Map<number, number>>(asksBook);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  useEffect(() => {
+    lastPriceRef.current = lastPrice;
+  }, [lastPrice]);
+
+  useEffect(() => {
+    candlesRef.current = candles;
+  }, [candles]);
+
+  useEffect(() => {
+    bidsBookRef.current = bidsBook;
+    asksBookRef.current = asksBook;
+  }, [bidsBook, asksBook]);
+
   const clientRef = useRef<BinanceStreamClient | null>(null);
   const tradesRef = useRef<TradeEvent[]>([]);
   const liqsRef = useRef<LiquidationEvent[]>([]);
@@ -201,13 +228,33 @@ export default function Home() {
   const lastWhaleRef = useRef<number>(0);
   const lastSweepRef = useRef<number>(0);
   const lastAbsorbRef = useRef<number>(0);
-  const wallAgesRef = useRef<Map<string, { born: number; peak: number }>>(new Map());
+  const lastBurstRef = useRef<number>(0);
+  const prevWallsRef = useRef<Map<number, { notional: number; ts: number; side: 'B' | 'A' }>>(new Map());
   const pendingEngineRef = useRef<{ dir: 'AL' | 'SAT'; idx: number; flip: boolean } | null>(null);
+  const trackingEventsRef = useRef<Array<{ eventKey: string; candleIdx: number; dir: 'AL' | 'SAT' }>>([]);
+
+  // UI / Layout States
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isSignalOpen, setIsSignalOpen] = useState(false);
 
   // Initialize DB on Mount
   useEffect(() => {
     initPatternDB();
   }, []);
+
+  // Keyboard shortcut for Fullscreen (F key) and Esc
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'f' || e.key === 'F') {
+        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+        setIsFullscreen((prev) => !prev);
+      } else if (e.key === 'Escape' && isFullscreen) {
+        setIsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isFullscreen]);
 
   // Save Settings & Favs on change
   const handleUpdateSettings = (newSettings: AppSettings) => {
@@ -215,6 +262,16 @@ export default function Home() {
     try {
       localStorage.setItem('fs_settings', JSON.stringify(newSettings));
     } catch {}
+  };
+
+  const handleUpdateSingleSetting = (key: keyof AppSettings, val: any) => {
+    setSettings((prev) => {
+      const next = { ...prev, [key]: val };
+      try {
+        localStorage.setItem('fs_settings', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
   };
 
   const handleToggleFav = (sym: string) => {
@@ -234,6 +291,9 @@ export default function Home() {
     // Reset flow states for new symbol
     tradesRef.current = [];
     liqsRef.current = [];
+    pendingEngineRef.current = null;
+    trackingEventsRef.current = [];
+    prevOiRef.current = null;
     setTrades([]);
     setLiquidations([]);
     setHeatmapFrames([]);
@@ -273,36 +333,49 @@ export default function Home() {
     return () => clearInterval(intervalId);
   }, []);
 
-  // 2. Load Historical Klines when Symbol / Interval Changes
+  // 2. Load Historical Klines & Run Pattern Backfill
   useEffect(() => {
     let active = true;
-    const loadKlines = async () => {
+    const loadKlinesAndBackfill = async () => {
       try {
         const data = await fetchKlines(symbol, interval, 600);
         if (active) {
           setCandles(data);
           if (data.length) setLastPrice(data[data.length - 1].close);
+          
+          // Asynchronously learn & backfill pattern stats from history
+          patternBackfillFromCandles(
+            symbol,
+            interval,
+            data,
+            settingsRef.current.ma1,
+            settingsRef.current.ma2,
+            settingsRef.current.ma3,
+            settingsRef.current.sarStep,
+            settingsRef.current.sarMax,
+            settingsRef.current.patternWinPct
+          ).catch((err) => console.warn('Backfill error:', err));
         }
       } catch (e) {
         console.warn('Failed to load klines:', e);
       }
     };
-    loadKlines();
+    loadKlinesAndBackfill();
     return () => {
       active = false;
     };
   }, [symbol, interval]);
 
-  // 3. Open Interest & Funding Rate Poller
+  // 3. Open Interest & Funding Rate Poller (Bug fix: no nested setState)
   useEffect(() => {
     const pollOI = async () => {
       try {
         const [oi, prem] = await Promise.all([fetchOpenInterest(symbol), fetchPremiumIndex(symbol)]);
         if (oi !== null) {
-          setPrevOi((prev) => {
-            setOpenInterest(oi);
-            return prev ?? oi;
-          });
+          setOpenInterest(oi);
+          if (prevOiRef.current === null) {
+            prevOiRef.current = oi;
+          }
         }
         if (prem.fundingRate !== null) setFundingRate(prem.fundingRate);
         if (prem.markPrice !== null) setMarkPrice(prem.markPrice);
@@ -321,6 +394,11 @@ export default function Home() {
     const now = Date.now();
     const recentTrades = tradesRef.current;
     const recentLiqs = liqsRef.current;
+    const currPrice = lastPriceRef.current;
+    const currSettings = settingsRef.current;
+    const currCandles = candlesRef.current;
+    const currBids = bidsBookRef.current;
+    const currAsks = asksBookRef.current;
 
     // 60s CVD & notional
     let cvd60 = 0;
@@ -360,54 +438,55 @@ export default function Home() {
     // OBI (Order Book Imbalance within 1% band)
     let bestBid = 0;
     let bestAsk = Infinity;
-    bidsBook.forEach((_, p) => {
+    currBids.forEach((_, p) => {
       if (p > bestBid) bestBid = p;
     });
-    asksBook.forEach((_, p) => {
+    currAsks.forEach((_, p) => {
       if (p < bestAsk) bestAsk = p;
     });
     if (!Number.isFinite(bestAsk)) bestAsk = 0;
 
     const spread = bestAsk > bestBid && bestBid > 0 ? bestAsk - bestBid : 0;
-    const mid = (bestBid + bestAsk) / 2 || lastPrice;
+    const mid = (bestBid + bestAsk) / 2 || currPrice;
     const lo = mid * 0.99;
     const hi = mid * 1.01;
 
     let bidVol = 0;
     let askVol = 0;
-    bidsBook.forEach((q, p) => {
+    currBids.forEach((q, p) => {
       if (p >= lo) bidVol += p * q;
     });
-    asksBook.forEach((q, p) => {
+    currAsks.forEach((q, p) => {
       if (p <= hi) askVol += p * q;
     });
 
     const obi = bidVol + askVol > 0 ? (bidVol - askVol) / (bidVol + askVol) : 0;
 
     // OI Delta %
-    const oiChangePct = prevOi && openInterest ? ((openInterest - prevOi) / prevOi) * 100 : 0;
+    const prevOiVal = prevOiRef.current;
+    const oiChangePct = prevOiVal && openInterest ? ((openInterest - prevOiVal) / prevOiVal) * 100 : 0;
 
     // Range & ATR
-    const win = candles.slice(-20);
+    const win = currCandles.slice(-20);
     const hiP = Math.max(...win.map((c) => c.high), 1);
     const loP = Math.min(...win.map((c) => c.low), 1);
-    const rangePct = lastPrice > 0 ? (hiP - loP) / lastPrice : 0;
+    const rangePct = currPrice > 0 ? (hiP - loP) / currPrice : 0;
     const atrPct =
       win.length > 0 ? win.reduce((a, c) => a + (c.high - c.low) / (c.close || 1), 0) / win.length : 0;
     const tightRange = rangePct > 0 && (rangePct < 0.006 || atrPct < 0.0012);
 
-    const base5 = candles[Math.max(0, candles.length - 6)]?.close || lastPrice;
-    const change5 = base5 > 0 ? (lastPrice - base5) / base5 : 0;
-    const cascadeThr = (settings.cascadePct || 0.8) / 100;
+    const base5 = currCandles[Math.max(0, currCandles.length - 6)]?.close || currPrice;
+    const change5 = base5 > 0 ? (currPrice - base5) / base5 : 0;
+    const cascadeThr = (currSettings.cascadePct || 0.8) / 100;
 
     // Wall counts
     let wallBid = 0;
     let wallAsk = 0;
-    const wallMin = (settings.whaleMin || 300000) * 0.7;
-    bidsBook.forEach((q, p) => {
+    const wallMin = (currSettings.whaleMin || 300000) * 0.7;
+    currBids.forEach((q, p) => {
       if (p * q >= wallMin) wallBid++;
     });
-    asksBook.forEach((q, p) => {
+    currAsks.forEach((q, p) => {
       if (p * q >= wallMin) wallAsk++;
     });
 
@@ -435,16 +514,17 @@ export default function Home() {
       atrPct,
       tightRange,
       change5,
-      cascadeDown: change5 < -cascadeThr || longLiq60 > (settings.liqMin || 50000) * 2,
-      cascadeUp: change5 > cascadeThr || shortLiq60 > (settings.liqMin || 50000) * 2,
+      cascadeDown: change5 < -cascadeThr || longLiq60 > (currSettings.liqMin || 50000) * 2,
+      cascadeUp: change5 > cascadeThr || shortLiq60 > (currSettings.liqMin || 50000) * 2,
       wallCount: { bid: wallBid, ask: wallAsk }
     };
-  }, [bidsBook, asksBook, candles, fundingRate, lastPrice, markPrice, nextFundingTime, openInterest, prevOi, settings]);
+  }, [fundingRate, markPrice, nextFundingTime, openInterest]);
 
   // 5. Evaluate Raw Flow Scoring (Katman 2)
   const evaluateRawFlow = useCallback(
     (dir: 'AL' | 'SAT', idx: number): DecisionEvaluation => {
-      if (!settings.rawConfirm) {
+      const currSettings = settingsRef.current;
+      if (!currSettings.rawConfirm) {
         return {
           score: null,
           grade: 'HAM',
@@ -529,11 +609,11 @@ export default function Home() {
       }
 
       // Liquidation Clusters
-      if (dir === 'SAT' && snap.longLiq60 >= (settings.liqMin || 50000)) {
+      if (dir === 'SAT' && snap.longLiq60 >= (currSettings.liqMin || 50000)) {
         score += 12;
         reasons.push(`Likidasyon cascade: $${(snap.longLiq60 / 1000).toFixed(0)}k long liq tetiklendi.`);
       }
-      if (dir === 'AL' && snap.shortLiq60 >= (settings.liqMin || 50000)) {
+      if (dir === 'AL' && snap.shortLiq60 >= (currSettings.liqMin || 50000)) {
         score += 12;
         reasons.push(`Short squeeze cascade: $${(snap.shortLiq60 / 1000).toFixed(0)}k short liq tetiklendi.`);
       }
@@ -567,32 +647,71 @@ export default function Home() {
         metrics: snap
       };
     },
-    [computeFlowSnapshot, settings]
+    [computeFlowSnapshot]
   );
 
-  // 6. Signal Trigger Engine (Katman 1 MA/SAR)
+  // 6. Signal Trigger Engine (Katman 1 MA/SAR) + Live Pattern Pool Engine
   const runSignalEngine = useCallback(
     async (cs: Candle[]) => {
-      if (cs.length < (settings.ma3 || 50) + 5) return;
+      const currSettings = settingsRef.current;
+      if (cs.length < (currSettings.ma3 || 50) + 5) return;
+
       const ctx = patternContext(
         cs,
-        settings.ma1 || 9,
-        settings.ma2 || 21,
-        settings.ma3 || 50,
-        settings.sarStep || 0.02,
-        settings.sarMax || 0.2
+        currSettings.ma1 || 9,
+        currSettings.ma2 || 21,
+        currSettings.ma3 || 50,
+        currSettings.sarStep || 0.02,
+        currSettings.sarMax || 0.2
       );
       const i = cs.length - 1;
-      const ma1 = ctx.ma[settings.ma1 || 9];
-      const ma2 = ctx.ma[settings.ma2 || 21];
-      const ma3 = ctx.ma[settings.ma3 || 50];
+      const ma1 = ctx.ma[currSettings.ma1 || 9];
+      const ma2 = ctx.ma[currSettings.ma2 || 21];
+      const ma3 = ctx.ma[currSettings.ma3 || 50];
 
       if (!ma1 || !ma2 || !ma3 || ma1[i] === null || ma2[i - 1] === null || ma3[i] === null || ctx.trend[i] === null) {
         return;
       }
 
-      const primaryPair = `${settings.ma1 || 9}x${settings.ma2 || 21}`;
-      const crosses = patternCrossesAt(ctx, i, settings.ma1 || 9, settings.ma2 || 21, settings.ma3 || 50);
+      // Check tracking pattern events for settlement (20 bars pass)
+      const tracking = trackingEventsRef.current;
+      if (tracking.length > 0) {
+        const remaining: typeof tracking = [];
+        for (const tr of tracking) {
+          if (i - tr.candleIdx >= 20) {
+            const outcome = patternOutcome(cs, tr.candleIdx, tr.dir === 'AL' ? 'UP' : 'DOWN');
+            if (outcome) {
+              const ev = await dbIndexGet<PatternEvent>('events', 'eventKey', tr.eventKey);
+              if (ev && ev.status !== 'settled') {
+                ev.status = 'settled';
+                ev.settledAt = Date.now();
+                ev.ret5 = outcome.ret5;
+                ev.ret10 = outcome.ret10;
+                ev.ret20 = outcome.ret20;
+                ev.mfe20 = outcome.mfe20;
+                ev.mae20 = outcome.mae20;
+                ev.rMultiple = outcome.rMultiple;
+                ev.barsToMfe = outcome.barsToMfe;
+                ev.barsToMae = outcome.barsToMae;
+                await dbPut('events', ev);
+                // Recompute stats for the pattern
+                if (ev.patternKey) {
+                  await patternRecomputeStats(ev.patternKey, currSettings.patternWinPct || 0.15);
+                }
+                if (ev.coinPatternKey) {
+                  await patternRecomputeStats(ev.coinPatternKey, currSettings.patternWinPct || 0.15);
+                }
+              }
+            }
+          } else {
+            remaining.push(tr);
+          }
+        }
+        trackingEventsRef.current = remaining;
+      }
+
+      const primaryPair = `${currSettings.ma1 || 9}x${currSettings.ma2 || 21}`;
+      const crosses = patternCrossesAt(ctx, i, currSettings.ma1 || 9, currSettings.ma2 || 21, currSettings.ma3 || 50);
       const flipUp = ctx.trend[i - 1] === -1 && ctx.trend[i] === 1;
       const flipDown = ctx.trend[i - 1] === 1 && ctx.trend[i] === -1;
 
@@ -608,7 +727,7 @@ export default function Home() {
       if (pendingEngineRef.current) {
         const p = pendingEngineRef.current;
         const elapsed = i - p.idx;
-        if (elapsed > (settings.nWindow || 3)) {
+        if (elapsed > (currSettings.nWindow || 3)) {
           pendingEngineRef.current = null;
           setStatus('NOTR');
           setStatusRule('Pencere süresi doldu, tetikleyici iptal edildi.');
@@ -626,7 +745,7 @@ export default function Home() {
 
             if (ok) {
               // FIRE SIGNAL!
-              const rule = `MA${settings.ma1}×MA${settings.ma2} ${p.dir === 'AL' ? 'Golden' : 'Death'} Cross + SAR Flip (${elapsed} mum sonra) + MA${settings.ma3} Trend Filtresi`;
+              const rule = `MA${currSettings.ma1}×MA${currSettings.ma2} ${p.dir === 'AL' ? 'Golden' : 'Death'} Cross + SAR Flip (${elapsed} mum sonra) + MA${currSettings.ma3} Trend Filtresi`;
               const evalRes = evaluateRawFlow(p.dir, i);
               setStatus(p.dir);
               setStatusRule(rule);
@@ -636,15 +755,45 @@ export default function Home() {
               setCommentary(comment);
 
               // Query pattern stats
+              const sarBucket = elapsed === 0 ? 'SAR0' : elapsed === 1 ? 'SAR1' : elapsed <= 3 ? 'SAR2-3' : 'SARX';
               const patKey = patternId(
-                `${settings.ma1}x${settings.ma2}`,
+                `${currSettings.ma1}x${currSettings.ma2}`,
                 p.dir === 'AL' ? 'UP' : 'DOWN',
-                elapsed === 0 ? 'SAR0' : elapsed === 1 ? 'SAR1' : elapsed <= 3 ? 'SAR2-3' : 'SARX',
+                sarBucket,
                 'F1'
               );
               setActivePatternId(patKey);
               const stats = await patternGetStats(`${interval}:${patKey}`);
               setActivePatternStats(stats);
+
+              // Record Live Pattern Event to DB for ongoing tracking & learning
+              const eventKey = `${symbol}_${interval}_${cs[i].time}_${patKey}`;
+              const globalKey = `${interval}:${patKey}`;
+              const coinKey = `${symbol}:${interval}:${patKey}`;
+              
+              const liveEvent: PatternEvent = {
+                schemaVersion: PPOOL_SCHEMA_VERSION,
+                source: 'live',
+                coin: symbol,
+                timeframe: interval,
+                timestamp: cs[i].time * 1000,
+                eventKey,
+                pair: `${currSettings.ma1}x${currSettings.ma2}`,
+                dir: p.dir === 'AL' ? 'UP' : 'DOWN',
+                filter: 'F1',
+                sarBucket,
+                patternId: patKey,
+                patternKey: globalKey,
+                coinPatternKey: coinKey,
+                volRegime: 'MID',
+                trendRegime: p.dir === 'AL' ? 'UP' : 'DOWN',
+                regimeKey: `MID_${p.dir === 'AL' ? 'UP' : 'DOWN'}`,
+                refClose: cs[i].close,
+                status: 'tracking',
+                createdAt: Date.now()
+              };
+              await dbAdd('events', liveEvent).catch(() => {});
+              trackingEventsRef.current.push({ eventKey, candleIdx: i, dir: p.dir });
 
               // Push to Signal Log
               setSignals((prev) => [
@@ -666,24 +815,24 @@ export default function Home() {
             } else {
               setStatus('IZLEMEDE');
               setStatusRule(
-                `${p.dir} kurgusu: Cross + SAR flip tamam, MA${settings.ma3} trend filtresi bekleniyor.`
+                `${p.dir} kurgusu: Cross + SAR flip tamam, MA${currSettings.ma3} trend filtresi bekleniyor.`
               );
               setCommentary(generateCommentary('IZLEMEDE', null));
             }
           } else {
             setStatus('IZLEMEDE');
             setStatusRule(
-              `${p.dir === 'AL' ? 'Golden' : 'Death'} cross oluştu, SAR flip onayı bekleniyor (${elapsed}/${settings.nWindow} mum).`
+              `${p.dir === 'AL' ? 'Golden' : 'Death'} cross oluştu, SAR flip onayı bekleniyor (${elapsed}/${currSettings.nWindow} mum).`
             );
             setCommentary(generateCommentary('IZLEMEDE', null));
           }
         }
       }
     },
-    [evaluateRawFlow, interval, settings]
+    [evaluateRawFlow, interval, symbol]
   );
 
-  // 7. Initialize Real-Time WebSocket Streaming Client
+  // 7. Initialize Real-Time WebSocket Streaming Client (Stable Lifecycle)
   useEffect(() => {
     const client = new BinanceStreamClient(symbol, interval, {
       onKline: (candle, isClosed) => {
@@ -698,53 +847,76 @@ export default function Home() {
             updated = [...prev, candle];
             if (updated.length > 700) updated.shift();
           }
-
-          if (isClosed) {
-            // Run signal engine & pattern pool recorder on closed candle
-            runSignalEngine(updated);
-          }
           return updated;
         });
+
+        if (isClosed) {
+          // Trigger signal engine on closed candle
+          runSignalEngine(candlesRef.current);
+        }
       },
       onTrade: (trade) => {
         tradesRef.current.push(trade);
-        if (tradesRef.current.length > 5000) tradesRef.current.shift();
+        if (tradesRef.current.length > 4000) {
+          tradesRef.current = tradesRef.current.slice(-3000);
+        }
 
-        // Whale Detector
-        const whaleMin = settings.whaleMin || 300000;
-        if (trade.notional >= whaleMin && trade.ts - lastWhaleRef.current > 2000) {
-          lastWhaleRef.current = trade.ts;
+        const now = trade.ts;
+        const whaleMin = settingsRef.current.whaleMin || 300000;
+
+        // 1. Whale Detector
+        if (trade.notional >= whaleMin && now - lastWhaleRef.current > 2000) {
+          lastWhaleRef.current = now;
           const ev: FlowEvent = {
-            id: `${trade.ts}-${Math.random()}`,
+            id: `${now}-${Math.random()}`,
             type: 'WHALE',
             sev: trade.notional >= whaleMin * 2 ? 'high' : 'medium',
             text: `Whale ${trade.side.toUpperCase()} $${(trade.notional / 1000).toFixed(0)}k @ $${trade.price}`,
-            ts: trade.ts,
+            ts: now,
             side: trade.side
           };
           setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
         }
 
-        // Sweep Detector (>=4 trades on same side in <1.8s totaling > wmin * 1.8)
-        const now = trade.ts;
-        if (now - lastSweepRef.current > 5000) {
+        // 2. Sweep Detector (>=4 trades on same side in <1.8s totaling > whaleMin * 1.5)
+        if (now - lastSweepRef.current > 4000) {
           const recent = tradesRef.current.filter((t) => now - t.ts < 1800);
           ['buy', 'sell'].forEach((side) => {
             const sameSide = recent.filter((t) => t.side === side);
             const total = sameSide.reduce((a, b) => a + b.notional, 0);
-            if (total > whaleMin * 1.6 && sameSide.length >= 4) {
+            if (total > whaleMin * 1.5 && sameSide.length >= 4) {
               lastSweepRef.current = now;
               const ev: FlowEvent = {
                 id: `${now}-${Math.random()}`,
                 type: 'SWEEP',
                 sev: 'high',
-                text: `SWEEP ${side.toUpperCase()} $${(total / 1000).toFixed(0)}k / ${sameSide.length} işlem`,
+                text: `SWEEP ${side.toUpperCase()} $${(total / 1000).toFixed(0)}k (${sameSide.length} işlem)`,
                 ts: now,
                 side: side as 'buy' | 'sell'
               };
               setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
             }
           });
+        }
+
+        // 3. Delta Burst Detector (rapid CVD surge in <5s)
+        if (now - lastBurstRef.current > 8000) {
+          const recent5s = tradesRef.current.filter((t) => now - t.ts < 5000);
+          const cvd5s = recent5s.reduce((a, b) => a + b.delta, 0);
+          const vol5s = recent5s.reduce((a, b) => a + b.notional, 0);
+          if (vol5s > whaleMin * 1.8 && Math.abs(cvd5s) / vol5s > 0.75) {
+            lastBurstRef.current = now;
+            const side = cvd5s > 0 ? 'buy' : 'sell';
+            const ev: FlowEvent = {
+              id: `${now}-${Math.random()}`,
+              type: 'DELTA_BURST',
+              sev: 'high',
+              text: `DELTA BURST ${side.toUpperCase()} CVD: $${(cvd5s / 1000).toFixed(0)}k (Hacim: $${(vol5s / 1000).toFixed(0)}k)`,
+              ts: now,
+              side
+            };
+            setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
+          }
         }
       },
       onMarkPrice: (mark) => {
@@ -754,10 +926,12 @@ export default function Home() {
       },
       onLiquidation: (liq) => {
         liqsRef.current.push(liq);
-        if (liqsRef.current.length > 500) liqsRef.current.shift();
+        if (liqsRef.current.length > 500) {
+          liqsRef.current = liqsRef.current.slice(-400);
+        }
         setLiquidations((prev) => [liq, ...prev.slice(0, 50)]);
 
-        if (liq.notional >= (settings.liqMin || 50000)) {
+        if (liq.notional >= (settingsRef.current.liqMin || 50000)) {
           const ev: FlowEvent = {
             id: `${liq.ts}-${Math.random()}`,
             type: 'LIQUIDATION',
@@ -772,9 +946,41 @@ export default function Home() {
         setBidsBook(new Map(depth.bids));
         setAsksBook(new Map(depth.asks));
 
-        // Sample Heatmap frame every 1s
         const now = Date.now();
-        if (now - lastHeatSampleRef.current >= 1000 && settings.showHeatmap) {
+        const whaleMin = settingsRef.current.whaleMin || 300000;
+
+        // Spoofing Detector: Check if massive wall disappeared without significant trade volume
+        const currentWalls = new Map<number, { notional: number; ts: number; side: 'B' | 'A' }>();
+        depth.bids.forEach((q, p) => {
+          const n = p * q;
+          if (n >= whaleMin) currentWalls.set(p, { notional: n, ts: now, side: 'B' });
+        });
+        depth.asks.forEach((q, p) => {
+          const n = p * q;
+          if (n >= whaleMin) currentWalls.set(p, { notional: n, ts: now, side: 'A' });
+        });
+
+        prevWallsRef.current.forEach((prevWall, price) => {
+          if (!currentWalls.has(price)) {
+            // Wall was removed; check lifetime
+            const age = now - prevWall.ts;
+            if (age < 4000 && prevWall.notional >= whaleMin * 1.5) {
+              const ev: FlowEvent = {
+                id: `${now}-${Math.random()}`,
+                type: 'SPOOF',
+                sev: 'medium',
+                text: `SPOOF Wall İptal: $${(prevWall.notional / 1000).toFixed(0)}k ${prevWall.side === 'B' ? 'BID' : 'ASK'} @ $${price} (${(age / 1000).toFixed(1)}s)`,
+                ts: now,
+                side: prevWall.side === 'B' ? 'buy' : 'sell'
+              };
+              setFlowEvents((prev) => [ev, ...prev.slice(0, 30)]);
+            }
+          }
+        });
+        prevWallsRef.current = currentWalls;
+
+        // Sample Heatmap frame every 1s
+        if (now - lastHeatSampleRef.current >= 1000 && settingsRef.current.showHeatmap) {
           lastHeatSampleRef.current = now;
           let bestBid = 0;
           let bestAsk = Infinity;
@@ -784,7 +990,7 @@ export default function Home() {
           depth.asks.forEach((_, p) => {
             if (p < bestAsk) bestAsk = p;
           });
-          const mid = (bestBid + bestAsk) / 2 || lastPrice;
+          const mid = (bestBid + bestAsk) / 2 || lastPriceRef.current;
 
           if (mid > 0) {
             const bins: HeatmapFrame['bins'] = [];
@@ -830,7 +1036,7 @@ export default function Home() {
       client.stop();
       clientRef.current = null;
     };
-  }, [interval, lastPrice, runSignalEngine, settings, symbol]);
+  }, [symbol, interval, runSignalEngine]);
 
   // Periodic flow snapshot calculation
   useEffect(() => {
@@ -842,58 +1048,107 @@ export default function Home() {
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#0d1117] text-slate-100 antialiased font-sans">
-      {/* Top Navbar */}
-      <Navbar
-        symbol={symbol}
-        onSelectSymbol={handleSelectSymbol}
-        symbols={symbols}
-        tickers={tickers}
-        favs={favs}
-        onToggleFav={handleToggleFav}
-        activeView={activeView}
-        onChangeView={setActiveView}
-        lastPrice={lastPrice}
-        fundingRate={fundingRate}
-        nextFundingTime={nextFundingTime}
-        wsConnected={wsConnected}
-        wsMessage={wsMessage}
-      />
+      {/* Top Navbar (Hidden in Fullscreen mode for 100% pure chart immersion) */}
+      {!isFullscreen && (
+        <Navbar
+          symbol={symbol}
+          onSelectSymbol={handleSelectSymbol}
+          symbols={symbols}
+          tickers={tickers}
+          favs={favs}
+          onToggleFav={handleToggleFav}
+          activeView={activeView}
+          onChangeView={setActiveView}
+          lastPrice={lastPrice}
+          fundingRate={fundingRate}
+          nextFundingTime={nextFundingTime}
+          wsConnected={wsConnected}
+          wsMessage={wsMessage}
+        />
+      )}
 
       {/* Main View Router */}
       <main className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
         {activeView === 'chart' && (
-          <div className="flex-1 flex flex-col min-h-0">
-            {/* Top Flow Metrics Bar */}
-            <FlowMetricsPanel flow={flowSnapshot} lastPrice={lastPrice} />
+          <div className="flex-1 flex flex-col min-h-0 h-full relative">
+            {/* Top Collapsible Flow Ribbon */}
+            {!isFullscreen && (
+              <FlowMetricsPanel flow={flowSnapshot} lastPrice={lastPrice} mode="collapsible" />
+            )}
 
             {/* Middle: Interactive Candlestick + Canvas Overlays */}
-            <ChartTerminal
-              symbol={symbol}
-              interval={interval}
-              onSelectInterval={handleSelectInterval}
-              candles={candles}
-              settings={settings}
-              flowSnapshot={flowSnapshot}
-              heatmapFrames={heatmapFrames}
-              bidsBook={bidsBook}
-              asksBook={asksBook}
-              signals={signals}
-              liquidations={liquidations}
-              flowEvents={flowEvents}
-              lastPrice={lastPrice}
-            />
-
-            {/* Bottom: Decision Engine Card */}
-            <div className="p-3 border-t border-[#22272e] bg-[#0d1117] max-h-44 overflow-y-auto">
-              <SignalCard
-                status={status}
-                statusRule={statusRule}
-                evaluation={evaluation}
-                commentary={commentary}
-                patternStats={activePatternStats}
-                patternId={activePatternId}
+            <div className="flex-1 min-h-0 relative h-full w-full">
+              <ChartTerminal
+                symbol={symbol}
+                interval={interval}
+                onSelectInterval={handleSelectInterval}
+                candles={candles}
+                settings={settings}
+                flowSnapshot={flowSnapshot}
+                heatmapFrames={heatmapFrames}
+                bidsBook={bidsBook}
+                asksBook={asksBook}
+                signals={signals}
+                liquidations={liquidations}
+                flowEvents={flowEvents}
+                lastPrice={lastPrice}
+                onUpdateSetting={handleUpdateSingleSetting}
+                isFullscreen={isFullscreen}
+                onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}
               />
             </div>
+
+            {/* Bottom Collapsible Decision Engine Strip */}
+            {!isFullscreen && (
+              <div className="border-t border-[#22272e] bg-[#12161c] transition-all duration-200 shrink-0 select-none z-30">
+                <div
+                  onClick={() => setIsSignalOpen(!isSignalOpen)}
+                  className="px-3 py-1.5 flex items-center justify-between cursor-pointer hover:bg-[#161b22] text-xs"
+                >
+                  <div className="flex items-center gap-2 font-mono overflow-hidden">
+                    <span
+                      className={`px-2 py-0.5 rounded font-bold text-[11px] shrink-0 ${
+                        status === 'AL'
+                          ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                          : status === 'SAT'
+                          ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                          : status === 'IZLEMEDE'
+                          ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                          : 'bg-slate-500/20 text-slate-400 border border-slate-500/30'
+                      }`}
+                    >
+                      {status}
+                    </span>
+                    <span className="text-slate-300 font-semibold truncate text-[11px] sm:text-xs">
+                      {statusRule}
+                    </span>
+                    {evaluation && (
+                      <span className="hidden sm:inline text-slate-500 text-[11px] shrink-0">
+                        • Skor: <strong className="text-emerald-400">{evaluation.score}</strong>
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 text-slate-400 text-[11px] shrink-0 ml-2">
+                    <span className="hidden xs:inline">{isSignalOpen ? 'Gizle' : 'Karar Detayı'}</span>
+                    {isSignalOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
+                  </div>
+                </div>
+
+                {isSignalOpen && (
+                  <div className="p-3 border-t border-[#22272e] bg-[#0d1117] max-h-56 overflow-y-auto">
+                    <SignalCard
+                      status={status}
+                      statusRule={statusRule}
+                      evaluation={evaluation}
+                      commentary={commentary}
+                      patternStats={activePatternStats}
+                      patternId={activePatternId}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -939,6 +1194,21 @@ export default function Home() {
           />
         )}
       </main>
+
+      {/* Persistent Bottom Navigation Toolbar (Hidden in Fullscreen mode) */}
+      {!isFullscreen && (
+        <BottomToolbar
+          activeView={activeView}
+          onChangeView={setActiveView}
+          symbol={symbol}
+          lastPrice={lastPrice}
+          tickers={tickers}
+          wsConnected={wsConnected}
+          fundingRate={fundingRate}
+          isFullscreen={isFullscreen}
+          onToggleFullscreen={() => setIsFullscreen(!isFullscreen)}
+        />
+      )}
     </div>
   );
 }

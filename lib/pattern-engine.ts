@@ -198,7 +198,7 @@ export function patternContext(cs: Candle[], ma1: number = 9, ma2: number = 21, 
   return { cs, closes, ma, trend, atr };
 }
 
-export function patternRegimeAt(ctx: ReturnType<typeof patternContext>, i: number) {
+export function patternRegimeAt(ctx: ReturnType<typeof patternContext>, i: number, ma3: number = 50) {
   const atrWin = ctx.atr.slice(Math.max(0, i - 99), i + 1).filter((v): v is number => v !== null && Number.isFinite(v));
   const p33 = percentile(atrWin, 0.33);
   const p66 = percentile(atrWin, 0.66);
@@ -207,10 +207,10 @@ export function patternRegimeAt(ctx: ReturnType<typeof patternContext>, i: numbe
   if (val !== null && Number.isFinite(val) && p33 !== null && p66 !== null) {
     vol = val <= p33 ? 'LOW' : val >= p66 ? 'HIGH' : 'MID';
   }
-  const ma50 = ctx.ma[50];
+  const trendMa = ctx.ma[ma3] || ctx.ma[50];
   let trend: 'UP' | 'DOWN' | 'FLAT' = 'FLAT';
-  if (ma50 && ma50[i] !== null && i >= 10 && ma50[i - 10] !== null) {
-    const slope = (ma50[i]! - ma50[i - 10]!) / ma50[i - 10]!;
+  if (trendMa && trendMa[i] !== null && i >= 10 && trendMa[i - 10] !== null) {
+    const slope = (trendMa[i]! - trendMa[i - 10]!) / trendMa[i - 10]!;
     trend = slope > 0.001 ? 'UP' : slope < -0.001 ? 'DOWN' : 'FLAT';
   }
   return { vol, trend, key: `${vol}_${trend}` };
@@ -223,8 +223,8 @@ export function patternCrossesAt(ctx: ReturnType<typeof patternContext>, i: numb
     filter: 'F1' | 'F0';
     regime: ReturnType<typeof patternRegimeAt>;
   }[] = [];
-  const ma50 = ctx.ma[ma3] || ctx.ma[50];
-  if (i < 1 || !ma50 || ma50[i] === null) return out;
+  const trendMa = ctx.ma[ma3] || ctx.ma[50];
+  if (i < 1 || !trendMa || trendMa[i] === null) return out;
 
   for (const p of patternPairs(ma1, ma2, ma3)) {
     const f = ctx.ma[p.fast];
@@ -237,10 +237,10 @@ export function patternCrossesAt(ctx: ReturnType<typeof patternContext>, i: numb
     if (!dir) continue;
 
     const filter: 'F1' | 'F0' = dir === 'UP'
-      ? ctx.cs[i].close > ma50[i]! ? 'F1' : 'F0'
-      : ctx.cs[i].close < ma50[i]! ? 'F1' : 'F0';
+      ? ctx.cs[i].close > trendMa[i]! ? 'F1' : 'F0'
+      : ctx.cs[i].close < trendMa[i]! ? 'F1' : 'F0';
 
-    out.push({ pair: p.pair, dir, filter, regime: patternRegimeAt(ctx, i) });
+    out.push({ pair: p.pair, dir, filter, regime: patternRegimeAt(ctx, i, ma3) });
   }
   return out;
 }
@@ -383,4 +383,103 @@ export async function patternRecomputeStats(key: string, winThresholdPct: number
 
 export async function patternGetStats(key: string): Promise<PatternStats | null> {
   return (await dbGet<PatternStats>('poolStats', key)) || null;
+}
+
+export async function patternBackfillFromCandles(
+  coin: string,
+  timeframe: string,
+  candles: Candle[],
+  ma1: number = 9,
+  ma2: number = 21,
+  ma3: number = 50,
+  sarStep: number = 0.02,
+  sarMax: number = 0.2,
+  winThreshold: number = 0.15
+): Promise<{ added: number; settled: number }> {
+  if (candles.length < Math.max(ma3 + 10, 60)) return { added: 0, settled: 0 };
+  await initPatternDB();
+
+  const ctx = patternContext(candles, ma1, ma2, ma3, sarStep, sarMax);
+  const n = candles.length;
+  let added = 0;
+  let settled = 0;
+  const affectedKeys = new Set<string>();
+
+  for (let i = ma3 + 5; i < n; i++) {
+    const crosses = patternCrossesAt(ctx, i, ma1, ma2, ma3);
+    for (const cr of crosses) {
+      const sarRes = patternResolveSar(ctx, i, cr.dir, n - 1);
+      const sarBucket = sarRes ? sarRes.bucket : (n - 1 - i >= 4 ? 'SARX' : undefined);
+      if (!sarBucket) continue; // Still in resolve window
+
+      const patId = patternId(cr.pair, cr.dir, sarBucket, cr.filter);
+      const globalKey = `${timeframe}:${patId}`;
+      const coinKey = `${coin}:${timeframe}:${patId}`;
+      const eventKey = `${coin}_${timeframe}_${candles[i].time}_${patId}`;
+
+      const existing = await dbIndexGet<PatternEvent>('events', 'eventKey', eventKey);
+      const outcome = patternOutcome(candles, sarRes ? sarRes.finalIndex : i, cr.dir);
+
+      if (existing) {
+        if (existing.status !== 'settled' && outcome) {
+          existing.status = 'settled';
+          existing.settledAt = Date.now();
+          existing.ret5 = outcome.ret5;
+          existing.ret10 = outcome.ret10;
+          existing.ret20 = outcome.ret20;
+          existing.mfe20 = outcome.mfe20;
+          existing.mae20 = outcome.mae20;
+          existing.rMultiple = outcome.rMultiple;
+          existing.barsToMfe = outcome.barsToMfe;
+          existing.barsToMae = outcome.barsToMae;
+          await dbPut('events', existing);
+          settled++;
+          affectedKeys.add(globalKey);
+          affectedKeys.add(coinKey);
+        }
+        continue;
+      }
+
+      const ev: PatternEvent = {
+        schemaVersion: PPOOL_SCHEMA_VERSION,
+        source: 'backfill',
+        coin,
+        timeframe,
+        timestamp: candles[i].time * 1000,
+        eventKey,
+        pair: cr.pair,
+        dir: cr.dir,
+        filter: cr.filter,
+        sarBucket,
+        patternId: patId,
+        patternKey: globalKey,
+        coinPatternKey: coinKey,
+        volRegime: cr.regime.vol,
+        trendRegime: cr.regime.trend,
+        regimeKey: cr.regime.key,
+        refClose: candles[sarRes ? sarRes.finalIndex : i].close,
+        status: outcome ? 'settled' : 'tracking',
+        createdAt: Date.now(),
+        settledAt: outcome ? Date.now() : undefined,
+        ...(outcome || {})
+      };
+
+      await dbAdd('events', ev);
+      added++;
+      if (outcome) {
+        settled++;
+        affectedKeys.add(globalKey);
+        affectedKeys.add(coinKey);
+      }
+    }
+  }
+
+  // Recompute affected pattern keys
+  for (const key of affectedKeys) {
+    try {
+      await patternRecomputeStats(key, winThreshold);
+    } catch {}
+  }
+
+  return { added, settled };
 }

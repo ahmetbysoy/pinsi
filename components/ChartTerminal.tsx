@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback, useState } from 'react';
 import {
   createChart,
   CandlestickSeries,
@@ -16,6 +16,17 @@ import {
   type SeriesMarker,
   type Time
 } from 'lightweight-charts';
+import {
+  Maximize2,
+  Minimize2,
+  Layers,
+  Activity,
+  Zap,
+  TrendingUp,
+  Sliders,
+  Eye,
+  EyeOff
+} from 'lucide-react';
 import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent } from '@/lib/types';
 import { bollingerBands, macd, psar, rsi, sma, vwap } from '@/lib/indicators';
 
@@ -33,6 +44,9 @@ interface ChartTerminalProps {
   liquidations: LiquidationEvent[];
   flowEvents: FlowEvent[];
   lastPrice: number;
+  onUpdateSetting?: (key: keyof AppSettings, val: any) => void;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
 }
 
 const TFS = ['1m', '5m', '15m', '1h', '4h'];
@@ -50,9 +64,13 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   signals,
   liquidations,
   flowEvents,
-  lastPrice
+  lastPrice,
+  onUpdateSetting,
+  isFullscreen = false,
+  onToggleFullscreen
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const chartWrapperRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
@@ -73,6 +91,19 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
   // Overlay Canvases
   const heatmapCanvasRef = useRef<HTMLCanvasElement>(null);
   const domOverlayCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Browser Native Fullscreen Toggle
+  const handleFullscreenToggle = () => {
+    if (onToggleFullscreen) {
+      onToggleFullscreen();
+    } else {
+      if (!document.fullscreenElement) {
+        chartWrapperRef.current?.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+  };
 
   // Initialize Lightweight Charts
   useEffect(() => {
@@ -98,8 +129,8 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       rightPriceScale: {
         borderColor: '#2a3038',
         scaleMargins: {
-          top: 0.05,
-          bottom: settings.showRsi || settings.showMacd ? 0.35 : 0.12
+          top: 0.04,
+          bottom: settings.showRsi || settings.showMacd ? 0.30 : 0.08
         }
       }
     });
@@ -227,6 +258,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       if (!containerRef.current || !chartRef.current) return;
       const w = containerRef.current.clientWidth;
       const h = containerRef.current.clientHeight;
+      if (w <= 0 || h <= 0) return;
       chartRef.current.resize(w, h);
 
       // Resize overlay canvases with devicePixelRatio
@@ -251,7 +283,19 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       chart.remove();
       chartRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Update scale margins dynamically when RSI/MACD toggled
+  useEffect(() => {
+    if (!chartRef.current) return;
+    chartRef.current.priceScale('right').applyOptions({
+      scaleMargins: {
+        top: 0.04,
+        bottom: settings.showRsi || settings.showMacd ? 0.30 : 0.08
+      }
+    });
+  }, [settings.showRsi, settings.showMacd]);
 
   // Update Series Data on Candle or Settings Change
   useEffect(() => {
@@ -368,16 +412,13 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     // Liquidations
     if (settings.showLiq) {
       liquidations.slice(-20).forEach((liq) => {
-        if (liq.notional >= (settings.liqMin || 50000)) {
-          const isLongLiq = liq.type === 'LONG_LIQ';
-          markers.push({
-            time: Math.floor(liq.ts / 1000) as Time,
-            position: isLongLiq ? 'aboveBar' : 'belowBar',
-            color: isLongLiq ? '#ff8a80' : '#69f0ae',
-            shape: 'circle',
-            text: `LIQ $${(liq.notional / 1000).toFixed(0)}k`
-          });
-        }
+        markers.push({
+          time: (liq.ts / 1000) as Time,
+          position: liq.side === 'BUY' ? 'belowBar' : 'aboveBar',
+          color: liq.side === 'BUY' ? '#ef5350' : '#26a69a',
+          shape: 'circle',
+          text: `⚡${(liq.notional / 1e3).toFixed(0)}k`
+        });
       });
     }
 
@@ -385,167 +426,161 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     if (settings.whaleAlerts) {
       flowEvents
         .filter((e) => e.type === 'WHALE' || e.type === 'SWEEP')
-        .slice(0, 15)
-        .forEach((e) => {
+        .slice(-15)
+        .forEach((w) => {
           markers.push({
-            time: Math.floor(e.ts / 1000) as Time,
-            position: e.side === 'buy' ? 'belowBar' : 'aboveBar',
-            color: e.side === 'buy' ? '#38bdf8' : '#f43f5e',
-            shape: 'circle',
-            text: `${e.type}`
+            time: (w.ts / 1000) as Time,
+            position: 'aboveBar',
+            color: '#f59e0b',
+            shape: 'square',
+            text: `🐋${w.type}`
           });
         });
     }
 
-    markers.sort((a, b) => (a.time as number) - (b.time as number));
+    markers.sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
 
-    if (markerPrimitiveRef.current) {
-      try {
+    try {
+      if (markerPrimitiveRef.current) {
         markerPrimitiveRef.current.setMarkers(markers);
-      } catch {
-        markerPrimitiveRef.current = createSeriesMarkers(candleSeriesRef.current as any, markers);
+      } else {
+        markerPrimitiveRef.current = createSeriesMarkers(candleSeriesRef.current, markers);
       }
-    } else {
-      markerPrimitiveRef.current = createSeriesMarkers(candleSeriesRef.current as any, markers);
+    } catch {
+      // Fallback
     }
-  }, [candles, settings, signals, liquidations, flowEvents]);
+  }, [
+    candles,
+    flowEvents,
+    liquidations,
+    settings,
+    signals
+  ]);
 
-  // Draw Heatmap Overlay & DOM Ladder
+  // Canvas Heatmap & DOM Overlays
   const drawOverlays = useCallback(() => {
-    if (!containerRef.current || !chartRef.current || !candleSeriesRef.current) return;
+    if (!chartRef.current || !candleSeriesRef.current || !containerRef.current) return;
 
-    const w = containerRef.current.clientWidth;
-    const h = containerRef.current.clientHeight;
-    const rightScaleWidth = 75;
-    const chartRight = Math.max(0, w - rightScaleWidth);
+    const chart = chartRef.current;
+    const series = candleSeriesRef.current;
+    const width = containerRef.current.clientWidth;
+    const height = containerRef.current.clientHeight;
 
     // 1. Draw Liquidity Heatmap
-    const cvH = heatmapCanvasRef.current;
-    if (cvH && settings.showHeatmap && heatmapFrames.length) {
-      const ctx = cvH.getContext('2d');
+    if (heatmapCanvasRef.current && settings.showHeatmap) {
+      const cv = heatmapCanvasRef.current;
+      const ctx = cv.getContext('2d');
       if (ctx) {
-        ctx.clearRect(0, 0, w, h);
-        const timeScale = chartRef.current.timeScale();
+        ctx.clearRect(0, 0, width, height);
 
-        for (let i = 0; i < heatmapFrames.length; i++) {
-          const frame = heatmapFrames[i];
-          const x = timeScale.timeToCoordinate(frame.t as Time);
-          if (x === null || x === undefined || x < 0 || x > chartRight) continue;
+        if (heatmapFrames.length > 0) {
+          const timeScale = chart.timeScale();
+          heatmapFrames.forEach((frame) => {
+            const x = timeScale.timeToCoordinate((frame.t / 1000) as Time);
+            if (x === null || x < 0 || x > width) return;
 
-          const colW = Math.max(2, Math.min(14, 6));
+            const nextX = x + 10;
+            const barW = Math.max(3, nextX - x);
 
-          for (const bin of frame.bins) {
-            const y = candleSeriesRef.current.priceToCoordinate(bin.price);
-            if (y === null || y === undefined || y < 0 || y > h) continue;
+            frame.bins.forEach((bin) => {
+              const y = series.priceToCoordinate(bin.price);
+              if (y === null || y < 0 || y > height) return;
 
-            const power = Math.log1p(bin.notional) / Math.log1p(frame.max || bin.notional);
-            const alpha = Math.min(0.45, 0.04 + power * 0.35);
-
-            ctx.fillStyle =
-              bin.side === 'B'
-                ? `rgba(38, 166, 154, ${alpha.toFixed(3)})`
-                : `rgba(239, 83, 80, ${alpha.toFixed(3)})`;
-
-            ctx.fillRect(x, y - 2, colW, 4);
-          }
+              const alpha = Math.min(0.85, Math.max(0.08, Math.log10(bin.notional + 1) / 5));
+              ctx.fillStyle =
+                bin.side === 'B'
+                  ? `rgba(38, 166, 154, ${alpha})`
+                  : `rgba(239, 83, 80, ${alpha})`;
+              ctx.fillRect(x - barW / 2, y - 1.5, barW, 3);
+            });
+          });
         }
       }
+    } else if (heatmapCanvasRef.current) {
+      const ctx = heatmapCanvasRef.current.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, width, height);
     }
 
-    // 2. Draw DOM Ladder & Liquidity Walls on Right Edge
-    const cvD = domOverlayCanvasRef.current;
-    if (cvD && settings.showLadder && (bidsBook.size > 0 || asksBook.size > 0)) {
-      const ctx = cvD.getContext('2d');
+    // 2. Draw DOM Ladder & Liquidity Walls
+    if (domOverlayCanvasRef.current && settings.showLadder) {
+      const cv = domOverlayCanvasRef.current;
+      const ctx = cv.getContext('2d');
       if (ctx) {
-        ctx.clearRect(0, 0, w, h);
+        ctx.clearRect(0, 0, width, height);
 
-        const ladderWidth = 54;
-        const ladderX = chartRight - ladderWidth;
-        const raySpan = 100;
-        const rayLeft = Math.max(0, ladderX - raySpan);
+        const chartRight = width - 65;
+        const ladderWidth = 140;
+        const ladderLeft = chartRight - ladderWidth;
 
-        // Find max notional for normalization
-        let maxNotional = 1;
-        const topBids: { price: number; notional: number }[] = [];
-        const topAsks: { price: number; notional: number }[] = [];
+        // Ladder background
+        ctx.fillStyle = 'rgba(13, 17, 23, 0.45)';
+        ctx.fillRect(ladderLeft, 0, ladderWidth, height);
+        ctx.strokeStyle = 'rgba(42, 48, 56, 0.5)';
+        ctx.beginPath();
+        ctx.moveTo(ladderLeft, 0);
+        ctx.lineTo(ladderLeft, height);
+        ctx.stroke();
 
-        bidsBook.forEach((qty, price) => {
-          const notional = price * qty;
-          if (notional > maxNotional) maxNotional = notional;
-          topBids.push({ price, notional });
-        });
-
-        asksBook.forEach((qty, price) => {
-          const notional = price * qty;
-          if (notional > maxNotional) maxNotional = notional;
-          topAsks.push({ price, notional });
-        });
-
-        const logMax = Math.log1p(maxNotional);
-
-        // Draw Bids (Green)
-        topBids.forEach(({ price, notional }) => {
-          const y = candleSeriesRef.current?.priceToCoordinate(price);
-          if (y === null || y === undefined || y < 0 || y > h) return;
-
-          const ratio = Math.log1p(notional) / logMax;
-          const barW = Math.max(2, ladderWidth * ratio);
-
-          // Ladder Bar
-          ctx.fillStyle = `rgba(38, 166, 154, ${Math.min(0.8, 0.15 + ratio * 0.65).toFixed(2)})`;
-          ctx.fillRect(ladderX, y - 1.5, barW, 3);
-
-          // Wall Ray for large liquidity
-          if (notional >= (settings.whaleMin || 300000) * 0.7) {
-            const grad = ctx.createLinearGradient(rayLeft, y, ladderX, y);
-            grad.addColorStop(0, 'rgba(38, 166, 154, 0)');
-            grad.addColorStop(1, 'rgba(38, 166, 154, 0.45)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(rayLeft, y - 1, ladderX - rayLeft, 2);
-
-            // Text Label
-            ctx.fillStyle = '#26a69a';
-            ctx.font = 'bold 9px monospace';
-            ctx.textAlign = 'right';
-            ctx.fillText(`$${(notional / 1000).toFixed(0)}k`, ladderX - 4, y + 3);
-          }
-        });
+        let maxVol = 1;
+        bidsBook.forEach((v) => { if (v > maxVol) maxVol = v; });
+        asksBook.forEach((v) => { if (v > maxVol) maxVol = v; });
 
         // Draw Asks (Red)
-        topAsks.forEach(({ price, notional }) => {
-          const y = candleSeriesRef.current?.priceToCoordinate(price);
-          if (y === null || y === undefined || y < 0 || y > h) return;
+        asksBook.forEach((vol, price) => {
+          const y = series.priceToCoordinate(price);
+          if (y === null || y < 0 || y > height) return;
 
-          const ratio = Math.log1p(notional) / logMax;
-          const barW = Math.max(2, ladderWidth * ratio);
+          const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
+          const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
 
-          // Ladder Bar
-          ctx.fillStyle = `rgba(239, 83, 80, ${Math.min(0.8, 0.15 + ratio * 0.65).toFixed(2)})`;
-          ctx.fillRect(ladderX, y - 1.5, barW, 3);
+          ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.55)' : 'rgba(239, 83, 80, 0.25)';
+          ctx.fillRect(chartRight - barLen, y - 1, barLen, 2.5);
 
-          // Wall Ray for large liquidity
-          if (notional >= (settings.whaleMin || 300000) * 0.7) {
-            const grad = ctx.createLinearGradient(rayLeft, y, ladderX, y);
-            grad.addColorStop(0, 'rgba(239, 83, 80, 0)');
-            grad.addColorStop(1, 'rgba(239, 83, 80, 0.45)');
-            ctx.fillStyle = grad;
-            ctx.fillRect(rayLeft, y - 1, ladderX - rayLeft, 2);
-
-            // Text Label
-            ctx.fillStyle = '#ef5350';
-            ctx.font = 'bold 9px monospace';
-            ctx.textAlign = 'right';
-            ctx.fillText(`$${(notional / 1000).toFixed(0)}k`, ladderX - 4, y + 3);
+          if (isWall) {
+            ctx.strokeStyle = 'rgba(239, 83, 80, 0.9)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(chartRight, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
           }
         });
 
-        // Mid-price indicator line
+        // Draw Bids (Green)
+        bidsBook.forEach((vol, price) => {
+          const y = series.priceToCoordinate(price);
+          if (y === null || y < 0 || y > height) return;
+
+          const barLen = Math.min(ladderWidth, (vol / maxVol) * ladderWidth);
+          const isWall = (vol / maxVol) * 100 >= (settings.wallPct || 90);
+
+          ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.55)' : 'rgba(38, 166, 154, 0.25)';
+          ctx.fillRect(chartRight - barLen, y - 1, barLen, 2.5);
+
+          if (isWall) {
+            ctx.strokeStyle = 'rgba(38, 166, 154, 0.9)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(chartRight, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        });
+
+        // Current Spread Ray
         if (flowSnapshot.bestBid && flowSnapshot.bestAsk) {
-          const mid = (flowSnapshot.bestBid + flowSnapshot.bestAsk) / 2;
-          const my = candleSeriesRef.current.priceToCoordinate(mid);
-          if (my !== null && my !== undefined && my >= 0 && my <= h) {
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-            ctx.setLineDash([4, 4]);
+          const bidY = series.priceToCoordinate(flowSnapshot.bestBid);
+          const askY = series.priceToCoordinate(flowSnapshot.bestAsk);
+          if (bidY !== null && askY !== null) {
+            const my = (bidY + askY) / 2;
+            const rayLeft = chartRight - 35;
+            ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 2]);
             ctx.beginPath();
             ctx.moveTo(rayLeft, my);
             ctx.lineTo(chartRight, my);
@@ -569,16 +604,28 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     };
   }, [drawOverlays]);
 
+  const toggleInd = (key: keyof AppSettings) => {
+    if (onUpdateSetting) {
+      onUpdateSetting(key, !settings[key]);
+    }
+  };
+
   return (
-    <div className="flex-1 flex flex-col min-h-0 bg-[#0d1117] relative select-none">
-      {/* Timeframe Bar */}
-      <div className="h-9 border-b border-[#22272e] bg-[#12161c] px-3 flex items-center justify-between text-xs">
-        <div className="flex items-center gap-1">
+    <div
+      ref={chartWrapperRef}
+      className={`flex-1 flex flex-col min-h-0 bg-[#0d1117] relative select-none w-full ${
+        isFullscreen ? 'fixed inset-0 z-50 h-screen w-screen' : 'h-full'
+      }`}
+    >
+      {/* Timeframe & Indicator Quick Bar */}
+      <div className="h-9 border-b border-[#22272e] bg-[#12161c] px-2 sm:px-3 flex items-center justify-between text-xs overflow-x-auto no-scrollbar gap-2">
+        {/* Left: Timeframes */}
+        <div className="flex items-center gap-1 shrink-0">
           {TFS.map((tf) => (
             <button
               key={tf}
               onClick={() => onSelectInterval(tf)}
-              className={`px-2.5 py-1 rounded font-mono font-bold transition-colors ${
+              className={`px-2 py-0.5 sm:px-2.5 sm:py-1 rounded font-mono text-[11px] sm:text-xs font-bold transition-colors ${
                 interval === tf
                   ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-[#181d24]'
@@ -589,44 +636,123 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
           ))}
         </div>
 
-        {/* Quick CVD & OBI Badges on Chart Header */}
-        <div className="flex items-center gap-3 font-mono text-[11px]">
-          <div className="flex items-center gap-1">
-            <span className="text-slate-500">CVD 60s:</span>
-            <span
-              className={`font-bold ${
-                flowSnapshot.cvd60 > 0
-                  ? 'text-emerald-400'
-                  : flowSnapshot.cvd60 < 0
-                  ? 'text-rose-400'
-                  : 'text-slate-400'
-              }`}
-            >
-              {flowSnapshot.cvd60 > 0 ? '+' : ''}
-              {(flowSnapshot.cvd60 / 1e3).toFixed(1)}k
-            </span>
-          </div>
+        {/* Center: Quick Indicator Pills */}
+        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar text-[11px] font-mono shrink-0">
+          <button
+            onClick={() => toggleInd('showMa')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showMa
+                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="Moving Averages (MA 9/21/50)"
+          >
+            MA
+          </button>
 
-          <div className="flex items-center gap-1">
-            <span className="text-slate-500">OBI:</span>
-            <span
-              className={`font-bold ${
-                flowSnapshot.obi > 0
-                  ? 'text-emerald-400'
-                  : flowSnapshot.obi < 0
-                  ? 'text-rose-400'
-                  : 'text-slate-400'
-              }`}
-            >
-              {flowSnapshot.obi > 0 ? '+' : ''}
-              {(flowSnapshot.obi * 100).toFixed(1)}%
-            </span>
-          </div>
+          <button
+            onClick={() => toggleInd('showSar')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showSar
+                ? 'bg-sky-500/20 text-sky-300 border-sky-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="Parabolic SAR"
+          >
+            SAR
+          </button>
+
+          <button
+            onClick={() => toggleInd('showVwap')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showVwap
+                ? 'bg-orange-500/20 text-orange-300 border-orange-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="VWAP"
+          >
+            VWAP
+          </button>
+
+          <button
+            onClick={() => toggleInd('showHeatmap')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showHeatmap
+                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="Likidite Isı Haritası (Heatmap)"
+          >
+            HEAT
+          </button>
+
+          <button
+            onClick={() => toggleInd('showLadder')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showLadder
+                ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="DOM Ladder & Duvarlar"
+          >
+            DOM
+          </button>
+
+          <button
+            onClick={() => toggleInd('showBB')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showBB
+                ? 'bg-blue-500/20 text-blue-300 border-blue-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="Bollinger Bands"
+          >
+            BB
+          </button>
+
+          <button
+            onClick={() => toggleInd('showRsi')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showRsi
+                ? 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="RSI Oscillator"
+          >
+            RSI
+          </button>
+
+          <button
+            onClick={() => toggleInd('showMacd')}
+            className={`px-1.5 py-0.5 rounded border transition-colors ${
+              settings.showMacd
+                ? 'bg-teal-500/20 text-teal-300 border-teal-500/40 font-bold'
+                : 'text-slate-500 border-[#22272e] hover:text-slate-300'
+            }`}
+            title="MACD"
+          >
+            MACD
+          </button>
+        </div>
+
+        {/* Right: Fullscreen & Quick Stats */}
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={handleFullscreenToggle}
+            className={`p-1.5 rounded border transition-colors ${
+              isFullscreen
+                ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
+                : 'text-slate-400 hover:text-slate-200 bg-[#161b22] border-[#22272e] hover:bg-[#1f242c]'
+            }`}
+            title={isFullscreen ? 'Tam Ekrandan Çık (Esc)' : 'Tam Ekran Grafik Modu'}
+          >
+            {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+          </button>
         </div>
       </div>
 
-      {/* Main Chart Area */}
-      <div className="flex-1 relative min-h-0 w-full overflow-hidden" ref={containerRef}>
+      {/* Main Chart Canvas Area */}
+      <div className="flex-1 relative min-h-0 w-full h-full overflow-hidden" ref={containerRef}>
         {/* Heatmap Canvas */}
         <canvas
           ref={heatmapCanvasRef}
