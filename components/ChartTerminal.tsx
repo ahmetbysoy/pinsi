@@ -338,6 +338,11 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     });
   }, [settings.showRsi, settings.showMacd]);
 
+  // Reset last bar tracking ref on symbol or interval switch so full setData is triggered
+  useEffect(() => {
+    lastBarTimeRef.current = null;
+  }, [symbol, interval]);
+
   // Update Series Data on Candle or Settings Change
   useEffect(() => {
     if (!chartRef.current || !candleSeriesRef.current || !candles.length || !indicatorData) return;

@@ -305,12 +305,16 @@ export default function Home() {
     latestOiRef.current = null;
     setTrades([]);
     setLiquidations([]);
+    setSignals([]);
+    setFlowEvents([]);
     setHeatmapFrames([]);
     setBidsBook(new Map());
     setAsksBook(new Map());
     setStatus('NOTR');
     setStatusRule('Yeni sembol yüklendi, taranıyor...');
     setEvaluation(null);
+    setActivePatternStats(null);
+    setActivePatternId(null);
   };
 
   const handleSelectInterval = (tf: string) => {
@@ -319,6 +323,18 @@ export default function Home() {
     try {
       localStorage.setItem('fs_interval', tf);
     } catch {}
+    // Yeni zaman dilimi: sinyal/olay bağlamı değişir, grafik ve log temizlensin.
+    setSignals([]);
+    setFlowEvents([]);
+    setLiquidations([]);
+    setHeatmapFrames([]);
+    pendingEngineRef.current = null;
+    trackingEventsRef.current = [];
+    setStatus('NOTR');
+    setStatusRule('Zaman dilimi değiştirildi, taranıyor...');
+    setEvaluation(null);
+    setActivePatternStats(null);
+    setActivePatternId(null);
   };
 
   // 1. Load Exchange Info & 24h Tickers
