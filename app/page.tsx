@@ -35,6 +35,7 @@ import {
   fetchPremiumIndex
 } from '@/lib/binance';
 import { generateCommentary } from '@/lib/commentary';
+import { soundEngine } from '@/lib/audio';
 import {
   initPatternDB,
   intervalToSeconds,
@@ -413,18 +414,40 @@ export default function Home() {
           setCandles(data);
           if (data.length) setLastPrice(data[data.length - 1].close);
           
-          // Asynchronously learn & backfill pattern stats from history
+          // Asynchronously learn & backfill pattern stats from current TF history
+          const currSettings = settingsRef.current;
           patternBackfillFromCandles(
             symbol,
             interval,
             data,
-            settingsRef.current.ma1,
-            settingsRef.current.ma2,
-            settingsRef.current.ma3,
-            settingsRef.current.sarStep,
-            settingsRef.current.sarMax,
-            settingsRef.current.patternWinPct
+            currSettings.ma1,
+            currSettings.ma2,
+            currSettings.ma3,
+            currSettings.sarStep,
+            currSettings.sarMax,
+            currSettings.patternWinPct
           ).catch((err) => console.warn('Backfill error:', err));
+
+          // Multi-Timeframe background backfill for 1m & 5m (F2-12)
+          const extraTfs = ['1m', '5m'].filter((tf) => tf !== interval);
+          extraTfs.forEach(async (tf) => {
+            try {
+              const extraData = await fetchKlines(symbol, tf, 400);
+              if (extraData && extraData.length > 50) {
+                await patternBackfillFromCandles(
+                  symbol,
+                  tf,
+                  extraData,
+                  currSettings.ma1,
+                  currSettings.ma2,
+                  currSettings.ma3,
+                  currSettings.sarStep,
+                  currSettings.sarMax,
+                  currSettings.patternWinPct
+                );
+              }
+            } catch {}
+          });
         }
       } catch (e) {
         console.warn('Failed to load klines:', e);
@@ -735,13 +758,19 @@ export default function Home() {
         }
       }
 
-      // Open Interest Dynamic & Expansion (F1-9)
+      // Open Interest Dynamic & Expansion (F1-9 / N2)
       if (snap.oiChangePct < -0.25 && snap.takerSpike) {
         score += dir === 'SAT' ? 8 : 4;
         reasons.push(`OI %${snap.oiChangePct.toFixed(2)} boşaldı + taker spike.`);
       } else if (snap.oiChangePct > 0.35) {
-        score += 4;
-        reasons.push(`Açık Pozisyon (OI) artışı (+4p): Pozisyon birikimi trendi besliyor (+%${snap.oiChangePct.toFixed(2)}).`);
+        const alignedWithCvd = (dir === 'AL' && snap.cvdBias > -0.05) || (dir === 'SAT' && snap.cvdBias < 0.05);
+        if (alignedWithCvd) {
+          score += 4;
+          reasons.push(`Açık Pozisyon (OI) uyumlu artışı (+4p): Pozisyon birikimi trendi besliyor (+%${snap.oiChangePct.toFixed(2)}).`);
+        } else {
+          score -= 2;
+          reasons.push(`Açık Pozisyon (OI) uyuşmazlığı (-2p): OI artarken CVD yönü desteklemiyor.`);
+        }
       } else if (snap.oiChangePct < -0.4 && !snap.takerSpike) {
         score -= 2;
         reasons.push('Açık Pozisyon azalması (-2p): Pozisyon kapanışları trendin gücünü zayıflatıyor.');
@@ -982,6 +1011,13 @@ export default function Home() {
                 ...prev.slice(0, 30)
               ]);
 
+              // Audio Alert Trigger
+              if (p.dir === 'AL') {
+                soundEngine.playBuySignal();
+              } else {
+                soundEngine.playSellSignal();
+              }
+
               pendingEngineRef.current = null;
             } else {
               setStatus('IZLEMEDE');
@@ -998,10 +1034,65 @@ export default function Home() {
             setCommentary(generateCommentary('IZLEMEDE', null));
           }
         }
+      } else {
+        // F2-2: Check secondary MA pairs (e.g. 9x50, 21x50) or F0 patterns pool-approved (Wilson >= 50, n >= 15)
+        const secondaryCrosses = crosses.filter((cr) => cr.pair !== primaryPair);
+        for (const secCross of secondaryCrosses) {
+          const sarBucket = 'SAR0';
+          const secPatKey = patternId(
+            secCross.pair,
+            secCross.dir === 'UP' ? 'UP' : 'DOWN',
+            sarBucket,
+            secCross.filter
+          );
+          const { stats: secStats } = await patternGetStatsBest(symbol, interval, secPatKey);
+          if (secStats && secStats.n >= 15 && secStats.wilsonLower >= 50) {
+            const secDir: 'AL' | 'SAT' = secCross.dir === 'UP' ? 'AL' : 'SAT';
+            const evalRes = evaluateRawFlow(secDir, i, secStats);
+            if (evalRes.score !== null && evalRes.score >= 60) {
+              const rule = `Havuz Onaylı İkincil Sinyal: MA ${secCross.pair} Cross (${secCross.filter}) [Wilson: %${secStats.wilsonLower.toFixed(0)}, N=${secStats.n}]`;
+              setStatus(secDir);
+              setStatusRule(rule);
+              setEvaluation(evalRes);
+              setActivePatternId(secPatKey);
+              setActivePatternStats(secStats);
+              setCommentary(generateCommentary(secDir, evalRes));
+
+              setSignals((prev) => [
+                {
+                  id: `${Date.now()}-${Math.random()}`,
+                  dir: secDir,
+                  rule,
+                  price: cs[i].close,
+                  ts: cs[i].time,
+                  score: evalRes.score,
+                  grade: evalRes.grade,
+                  reasons: evalRes.reasons,
+                  patternId: secPatKey
+                },
+                ...prev.slice(0, 30)
+              ]);
+
+              if (secDir === 'AL') {
+                soundEngine.playBuySignal();
+              } else {
+                soundEngine.playSellSignal();
+              }
+              break;
+            }
+          }
+        }
       }
     },
     [evaluateRawFlow, interval, symbol]
   );
+
+  const handleReconnect = useCallback(() => {
+    if (clientRef.current) {
+      clientRef.current.stop();
+      clientRef.current.start();
+    }
+  }, []);
 
   // 7. Initialize Real-Time WebSocket Streaming Client (Stable Lifecycle)
   useEffect(() => {
@@ -1039,6 +1130,7 @@ export default function Home() {
         // 1. Whale Detector
         if (trade.notional >= whaleMin && now - lastWhaleRef.current > 2000) {
           lastWhaleRef.current = now;
+          soundEngine.playWhale();
           const ev: FlowEvent = {
             id: `${now}-${Math.random()}`,
             type: 'WHALE',
@@ -1058,6 +1150,7 @@ export default function Home() {
             const total = sameSide.reduce((a, b) => a + b.notional, 0);
             if (total > whaleMin * 1.5 && sameSide.length >= 4) {
               lastSweepRef.current = now;
+              soundEngine.playWhale();
               const ev: FlowEvent = {
                 id: `${now}-${Math.random()}`,
                 type: 'SWEEP',
@@ -1084,6 +1177,7 @@ export default function Home() {
             
             if (slopeAligned) {
               lastBurstRef.current = now;
+              soundEngine.playWhale();
               const side = cvd5s > 0 ? 'buy' : 'sell';
               const ev: FlowEvent = {
                 id: `${now}-${Math.random()}`,
@@ -1139,6 +1233,7 @@ export default function Home() {
         setLiquidations((prev) => [liq, ...prev.slice(0, 50)]);
 
         if (liq.notional >= (settingsRef.current.liqMin || 50000)) {
+          soundEngine.playLiquidation();
           const ev: FlowEvent = {
             id: `${liq.ts}-${Math.random()}`,
             type: 'LIQUIDATION',
@@ -1231,7 +1326,7 @@ export default function Home() {
 
             setHeatmapFrames((prev) => {
               const next = [...prev, { t: Math.floor(now / 1000), bins: topBins, max: maxN }];
-              if (next.length > 300) next.shift();
+              if (next.length > 900) next.shift(); // 15-minute depth heatmap window
               return next;
             });
           }
@@ -1282,6 +1377,7 @@ export default function Home() {
           marketConnected={marketConnected}
           depthConnected={depthConnected}
           wsMessage={wsMessage}
+          onReconnect={handleReconnect}
         />
       )}
 

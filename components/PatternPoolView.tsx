@@ -12,11 +12,12 @@ import {
   CheckCircle2,
   AlertTriangle
 } from 'lucide-react';
-import { PatternStats } from '@/lib/types';
+import { PatternStats, PatternEvent } from '@/lib/types';
 import { fetchKlines } from '@/lib/binance';
 import {
   initPatternDB,
   dbAll,
+  dbIndexAll,
   patternAllIds,
   patternName,
   patternRecomputeStats,
@@ -34,6 +35,7 @@ interface PatternPoolViewProps {
 export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interval }) => {
   const [statsList, setStatsList] = useState<PatternStats[]>([]);
   const [selectedPattern, setSelectedPattern] = useState<PatternStats | null>(null);
+  const [recentEvents, setRecentEvents] = useState<PatternEvent[]>([]);
   const [tfFilter, setTfFilter] = useState<'all' | '1m' | '5m' | '15m' | '1h'>('all');
   const [scopeFilter, setScopeFilter] = useState<'all' | 'global' | 'coin'>('all');
   const [minN, setMinN] = useState<number>(0);
@@ -136,6 +138,27 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
       mounted = false;
     };
   }, [symbol]);
+
+  useEffect(() => {
+    const loadRecentEvents = async () => {
+      if (!selectedPattern) {
+        setRecentEvents([]);
+        return;
+      }
+      try {
+        await initPatternDB();
+        const evs = await dbIndexAll<PatternEvent>('events', 'patternKey', selectedPattern.key);
+        const settled = evs
+          .filter((e) => e.status === 'settled')
+          .sort((a, b) => b.timestamp - a.timestamp)
+          .slice(0, 20);
+        setRecentEvents(settled);
+      } catch (e) {
+        console.warn('Load recent events error:', e);
+      }
+    };
+    loadRecentEvents();
+  }, [selectedPattern]);
 
   const runBackfillScan = async () => {
     setBackfilling(true);
@@ -469,6 +492,61 @@ export const PatternPoolView: React.FC<PatternPoolViewProps> = ({ symbol, interv
                         ))}
                       </tbody>
                     </table>
+                  </div>
+                </div>
+                {/* Recent 20 Settled Transactions List (F2-10) */}
+                <div className="flex flex-col gap-2 mt-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold text-slate-400">Son 20 İşlem Örneği:</span>
+                    <span className="text-[10px] text-purple-400 font-mono">Settled ({recentEvents.length})</span>
+                  </div>
+                  <div className="border border-[#1e242d] rounded-lg overflow-hidden max-h-48 overflow-y-auto">
+                    {recentEvents.length > 0 ? (
+                      <table className="w-full text-left text-[10px] font-mono">
+                        <thead className="bg-[#11151b] text-slate-500 sticky top-0">
+                          <tr>
+                            <th className="p-1.5">Coin</th>
+                            <th className="p-1.5">Tarih</th>
+                            <th className="p-1.5">Rejim</th>
+                            <th className="p-1.5 text-right">Ret10</th>
+                            <th className="p-1.5 text-right">R-Mult</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#1e242d]">
+                          {recentEvents.map((ev, i) => (
+                            <tr key={ev.id || i} className="hover:bg-[#151a21]">
+                              <td className="p-1.5 font-bold text-slate-300">{ev.coin}</td>
+                              <td className="p-1.5 text-slate-500">
+                                {new Date(ev.timestamp).toLocaleDateString('tr-TR', {
+                                  day: '2-digit',
+                                  month: '2-digit'
+                                })}{' '}
+                                {new Date(ev.timestamp).toLocaleTimeString('tr-TR', {
+                                  hour: '2-digit',
+                                  minute: '2-digit'
+                                })}
+                              </td>
+                              <td className="p-1.5 text-slate-400">{ev.volRegime}/{ev.trendRegime}</td>
+                              <td
+                                className={`p-1.5 text-right font-bold ${
+                                  (ev.ret10 ?? 0) > 0 ? 'text-emerald-400' : 'text-rose-400'
+                                }`}
+                              >
+                                {(ev.ret10 ?? 0) > 0 ? '+' : ''}
+                                {(ev.ret10 ?? 0).toFixed(2)}%
+                              </td>
+                              <td className="p-1.5 text-right text-slate-300">
+                                {(ev.rMultiple ?? 0).toFixed(1)}R
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <div className="p-3 text-center text-[10px] text-slate-500 italic">
+                        Bu desene ait henüz kapanmış işlem örneği yok.
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

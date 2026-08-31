@@ -23,43 +23,43 @@ export const OrderFlowLog: React.FC<OrderFlowLogProps> = ({ flowEvents, signals 
     switch (type) {
       case 'WHALE':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 flex items-center gap-1">
+          <span className="pill bg-cyan-500/10 text-cyan-400 border-cyan-500/30">
             <Zap className="w-3 h-3" /> WHALE
           </span>
         );
       case 'SWEEP':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-500/10 text-purple-400 border border-purple-500/30 flex items-center gap-1">
+          <span className="pill bg-purple-500/10 text-purple-400 border-purple-500/30">
             <Flame className="w-3 h-3" /> SWEEP
           </span>
         );
       case 'ABSORPTION':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30 flex items-center gap-1">
+          <span className="pill bg-amber-500/10 text-amber-400 border-amber-500/30">
             <Activity className="w-3 h-3" /> ABSORPTION
           </span>
         );
       case 'DELTA_BURST':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+          <span className="pill bg-emerald-500/10 text-emerald-400 border-emerald-500/30">
             <Flame className="w-3 h-3" /> BURST
           </span>
         );
       case 'SPOOF':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/10 text-rose-400 border border-rose-500/30 flex items-center gap-1">
+          <span className="pill bg-rose-500/10 text-rose-400 border-rose-500/30">
             <AlertCircle className="w-3 h-3" /> SPOOF
           </span>
         );
       case 'LIQUIDATION':
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/10 text-rose-400 border border-rose-500/30 flex items-center gap-1">
+          <span className="pill bg-rose-500/10 text-rose-400 border-rose-500/30">
             <ShieldAlert className="w-3 h-3" /> LIQ
           </span>
         );
       default:
         return (
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-500/10 text-slate-400 border border-slate-500/30">
+          <span className="pill bg-slate-500/10 text-slate-400 border-slate-500/30">
             EVENT
           </span>
         );
@@ -69,7 +69,7 @@ export const OrderFlowLog: React.FC<OrderFlowLogProps> = ({ flowEvents, signals 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
       {/* Left: Real-time Order Flow Olayları */}
-      <div className="bg-[#12161c] border border-[#22272e] rounded-xl p-4 flex flex-col gap-3">
+      <div className="card-surface p-4 flex flex-col gap-3">
         <div className="flex items-center justify-between border-b border-[#1f252e] pb-2.5">
           <div className="flex items-center gap-2">
             <Activity className="w-4 h-4 text-cyan-400" />
@@ -80,8 +80,19 @@ export const OrderFlowLog: React.FC<OrderFlowLogProps> = ({ flowEvents, signals 
 
         <div className="flex-1 overflow-y-auto max-h-72 divide-y divide-[#1e242d] pr-1">
           {flowEvents.length > 0 ? (
-            flowEvents.map((ev) => (
-              <div key={ev.id} className="py-2 flex items-start justify-between gap-3 text-xs">
+            flowEvents.map((ev, idx) => (
+              <div
+                key={ev.id}
+                className={`py-2 px-1 rounded-lg flex items-start justify-between gap-3 text-xs transition-colors ${
+                  idx === 0
+                    ? ev.side === 'buy'
+                      ? 'flash-up'
+                      : ev.side === 'sell'
+                      ? 'flash-down'
+                      : ''
+                    : ''
+                }`}
+              >
                 <div className="flex items-start gap-2">
                   {getEventBadge(ev.type, ev.sev)}
                   <div>

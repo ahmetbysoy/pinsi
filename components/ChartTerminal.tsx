@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import { AppSettings, Candle, FlowSnapshot, HeatmapFrame, SignalLogEntry, LiquidationEvent, FlowEvent, SymbolInfo, PatternStats } from '@/lib/types';
 import { bollingerBands, macd, psar, rsi, sma, vwap } from '@/lib/indicators';
+import { intervalToSeconds } from '@/lib/pattern-engine';
 
 interface ChartTerminalProps {
   symbol: string;
@@ -52,22 +53,6 @@ interface ChartTerminalProps {
 }
 
 const TFS = ['1m', '5m', '15m', '1h', '4h'];
-
-// Binance interval kisayolunu saniyeye cevirir.
-function intervalToSeconds(tf: string): number {
-  const m: Record<string, number> = {
-    '1m': 60,
-    '3m': 180,
-    '5m': 300,
-    '15m': 900,
-    '30m': 1800,
-    '1h': 3600,
-    '2h': 7200,
-    '4h': 14400,
-    '1d': 86400
-  };
-  return m[tf] || 300;
-}
 
 // Olay zamanini (ms) en yakin mum acilis saniyesine yuvarlar.
 function snapToBarTime(tsMs: number, tfSec: number): number {
@@ -118,6 +103,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
 
   const lastBarTimeRef = useRef<number | null>(null);
   const overlayRafRef = useRef<number | null>(null);
+  const wallAgesRef = useRef<Map<string, number>>(new Map());
 
   // Overlay Canvases
   const heatmapCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -317,6 +303,15 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
       borderVisible: false
     });
 
+    // Save pan/zoom logical range
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (range && typeof window !== 'undefined') {
+        try {
+          sessionStorage.setItem(`fs_range_${symbol}_${interval}`, JSON.stringify(range));
+        } catch {}
+      }
+    });
+
     // Resize Observer
     const handleResize = () => {
       if (!containerRef.current || !chartRef.current) return;
@@ -415,6 +410,20 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
     } else {
       // Full batch setData on new candle arrival or symbol/interval switch
       candleSeriesRef.current.setData(candleData);
+      
+      // Restore range if available
+      try {
+        if (typeof window !== 'undefined') {
+          const stored = sessionStorage.getItem(`fs_range_${symbol}_${interval}`);
+          if (stored) {
+            const parsed = JSON.parse(stored);
+            if (parsed && typeof parsed.from === 'number' && typeof parsed.to === 'number') {
+              chartRef.current.timeScale().setVisibleLogicalRange(parsed);
+            }
+          }
+        }
+      } catch {}
+
       if (volSeriesRef.current) {
         const volData: HistogramData<Time>[] = settings.showVol
           ? candles.map((c) => ({
@@ -426,7 +435,7 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
         volSeriesRef.current.setData(volData);
       }
     }
-  }, [candles, settings.showVol]);
+  }, [candles, settings.showVol, symbol, interval]);
 
   // 2. Technical Indicators Feed (Only runs on new closed candle / indicatorData changes or settings toggle)
   useEffect(() => {
@@ -683,8 +692,15 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
               });
             });
 
+            let maxRasterNotional = 1;
+            rasterCells.forEach((c) => {
+              if (c.notional > maxRasterNotional) maxRasterNotional = c.notional;
+            });
+            const logMax = Math.log1p(maxRasterNotional);
+
             rasterCells.forEach((cell) => {
-              const alpha = Math.min(0.85, Math.max(0.08, Math.log10(cell.notional + 1) / 4.8));
+              const power = logMax > 0 ? Math.log1p(cell.notional) / logMax : 0.5;
+              const alpha = Math.min(0.88, Math.max(0.08, power * 0.85));
               const isBuy = cell.buyNotional >= cell.sellNotional;
               ctx.fillStyle = isBuy ? `rgba(38, 166, 154, ${alpha})` : `rgba(239, 83, 80, ${alpha})`;
               ctx.fillRect(cell.x - 2, cell.y - 1.5, 4, 3);
@@ -743,12 +759,21 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
           askSlots.forEach(({ notional, price }, slotY) => {
             const barLen = Math.min(ladderWidth, (notional / maxNotional) * ladderWidth);
             const isWall = (notional / maxNotional) * 100 >= (settings.wallPct || 85) && notional >= 15000;
+            const slotKey = `ask_${slotY}`;
 
             ctx.fillStyle = isWall ? 'rgba(239, 83, 80, 0.75)' : 'rgba(239, 83, 80, 0.35)';
             ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
             // Fix H5: Short glowing ray and badge instead of screen-crossing line
             if (isWall) {
+              const now = Date.now();
+              let firstSeen = wallAgesRef.current.get(slotKey);
+              if (!firstSeen) {
+                firstSeen = now;
+                wallAgesRef.current.set(slotKey, firstSeen);
+              }
+              const isEstablished = now - firstSeen >= 25000;
+
               const rayStart = Math.max(0, chartRight - ladderWidth - 65);
               const grad = ctx.createLinearGradient(rayStart, slotY, chartRight, slotY);
               grad.addColorStop(0, 'rgba(239, 83, 80, 0)');
@@ -760,11 +785,13 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
               ctx.lineTo(chartRight, slotY);
               ctx.stroke();
 
-              // Mini notional tag
+              // Mini notional tag (with ⏱ if resting for >= 25s)
               ctx.font = '9px monospace';
               ctx.fillStyle = 'rgba(239, 83, 80, 0.9)';
-              const tag = `$${(notional / 1000).toFixed(0)}k`;
+              const tag = `${isEstablished ? '⏱ ' : ''}$${(notional / 1000).toFixed(0)}k`;
               ctx.fillText(tag, rayStart + 5, slotY - 3);
+            } else {
+              wallAgesRef.current.delete(slotKey);
             }
           });
 
@@ -772,12 +799,21 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
           bidSlots.forEach(({ notional, price }, slotY) => {
             const barLen = Math.min(ladderWidth, (notional / maxNotional) * ladderWidth);
             const isWall = (notional / maxNotional) * 100 >= (settings.wallPct || 85) && notional >= 15000;
+            const slotKey = `bid_${slotY}`;
 
             ctx.fillStyle = isWall ? 'rgba(38, 166, 154, 0.75)' : 'rgba(38, 166, 154, 0.35)';
             ctx.fillRect(chartRight - barLen, slotY - 1, barLen, 2.5);
 
             // Fix H5: Short glowing ray and badge instead of screen-crossing line
             if (isWall) {
+              const now = Date.now();
+              let firstSeen = wallAgesRef.current.get(slotKey);
+              if (!firstSeen) {
+                firstSeen = now;
+                wallAgesRef.current.set(slotKey, firstSeen);
+              }
+              const isEstablished = now - firstSeen >= 25000;
+
               const rayStart = Math.max(0, chartRight - ladderWidth - 65);
               const grad = ctx.createLinearGradient(rayStart, slotY, chartRight, slotY);
               grad.addColorStop(0, 'rgba(38, 166, 154, 0)');
@@ -789,11 +825,13 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
               ctx.lineTo(chartRight, slotY);
               ctx.stroke();
 
-              // Mini notional tag
+              // Mini notional tag (with ⏱ if resting for >= 25s)
               ctx.font = '9px monospace';
               ctx.fillStyle = 'rgba(38, 166, 154, 0.9)';
-              const tag = `$${(notional / 1000).toFixed(0)}k`;
+              const tag = `${isEstablished ? '⏱ ' : ''}$${(notional / 1000).toFixed(0)}k`;
               ctx.fillText(tag, rayStart + 5, slotY - 3);
+            } else {
+              wallAgesRef.current.delete(slotKey);
             }
           });
 
@@ -814,10 +852,77 @@ export const ChartTerminal: React.FC<ChartTerminalProps> = ({
               ctx.setLineDash([]);
             }
           }
+
+          // 3. Draw Historical MFE / MAE Trajectory Vectors (F2-3)
+          if (signals.length > 0 && activePatternStats && activePatternStats.avgMfe20 > 0) {
+            const timeScale = chart.timeScale();
+            const recentSignals = signals.slice(0, 8);
+
+            recentSignals.forEach((sig) => {
+              const isAl = sig.dir === 'AL';
+              const tfSec = intervalToSeconds(interval);
+              const barTime = snapToBarTime(sig.ts * 1000, tfSec);
+              const startX = timeScale.timeToCoordinate(barTime as Time);
+              const startY = series.priceToCoordinate(sig.price);
+
+              if (startX === null || startY === null || startX < 0 || startX > width) return;
+
+              const mfeBars = Math.max(3, Math.min(20, Math.round(activePatternStats.medBarsToMfe || 8)));
+              const targetTime = (barTime + mfeBars * tfSec) as Time;
+              const endX = timeScale.timeToCoordinate(targetTime);
+
+              if (endX !== null && endX > startX && endX <= width + 120) {
+                const targetMfePrice = isAl
+                  ? sig.price * (1 + activePatternStats.avgMfe20 / 100)
+                  : sig.price * (1 - activePatternStats.avgMfe20 / 100);
+                const targetMaePrice = isAl
+                  ? sig.price * (1 - activePatternStats.avgMae20 / 100)
+                  : sig.price * (1 + activePatternStats.avgMae20 / 100);
+
+                const mfeY = series.priceToCoordinate(targetMfePrice);
+                const maeY = series.priceToCoordinate(targetMaePrice);
+
+                ctx.save();
+                ctx.setLineDash([4, 4]);
+
+                // MFE Trajectory Vector (Emerald)
+                if (mfeY !== null) {
+                  ctx.strokeStyle = 'rgba(16, 185, 129, 0.75)';
+                  ctx.lineWidth = 1.2;
+                  ctx.beginPath();
+                  ctx.moveTo(startX, startY);
+                  ctx.lineTo(endX, mfeY);
+                  ctx.stroke();
+
+                  ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
+                  ctx.beginPath();
+                  ctx.arc(endX, mfeY, 2.5, 0, 2 * Math.PI);
+                  ctx.fill();
+                }
+
+                // MAE Trajectory Vector (Rose)
+                if (maeY !== null) {
+                  ctx.strokeStyle = 'rgba(239, 68, 68, 0.65)';
+                  ctx.lineWidth = 1;
+                  ctx.beginPath();
+                  ctx.moveTo(startX, startY);
+                  ctx.lineTo(endX, maeY);
+                  ctx.stroke();
+
+                  ctx.fillStyle = 'rgba(239, 68, 68, 0.8)';
+                  ctx.beginPath();
+                  ctx.arc(endX, maeY, 2, 0, 2 * Math.PI);
+                  ctx.fill();
+                }
+
+                ctx.restore();
+              }
+            });
+          }
         }
       }
     });
-  }, [bidsBook, asksBook, heatmapFrames, settings, flowSnapshot]);
+  }, [bidsBook, asksBook, heatmapFrames, settings, flowSnapshot, signals, activePatternStats, interval]);
 
   // Clean up RAF on unmount
   useEffect(() => {

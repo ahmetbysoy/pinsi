@@ -11,9 +11,14 @@ import {
   Zap,
   Radio,
   Clock,
-  ChevronDown
+  ChevronDown,
+  RefreshCw,
+  Volume2,
+  VolumeX,
+  History
 } from 'lucide-react';
 import { Ticker24h } from '@/lib/types';
+import { soundEngine } from '@/lib/audio';
 
 interface NavbarProps {
   symbol: string;
@@ -31,6 +36,7 @@ interface NavbarProps {
   marketConnected?: boolean;
   depthConnected?: boolean;
   wsMessage?: string;
+  onReconnect?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -48,15 +54,54 @@ export const Navbar: React.FC<NavbarProps> = ({
   wsConnected,
   marketConnected = true,
   depthConnected = true,
-  wsMessage
+  wsMessage,
+  onReconnect
 }) => {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [fundingCountdown, setFundingCountdown] = useState('00:00:00');
+  const [soundActive, setSoundActive] = useState(() => soundEngine.isEnabled());
+  const [recents, setRecents] = useState<string[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const storedRecents = localStorage.getItem('fs_recents');
+        if (storedRecents) return JSON.parse(storedRecents);
+      } catch {}
+    }
+    return [];
+  });
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const searchRef = useRef<HTMLDivElement>(null);
 
   const isFav = favs.includes(symbol);
   const currentTicker = tickers.find((t) => t.symbol === symbol);
+
+  const handleSelectWithRecent = (sym: string) => {
+    onSelectSymbol(sym);
+    setSearchOpen(false);
+    setSearchQuery('');
+    setRecents((prev) => {
+      const next = [sym, ...prev.filter((s) => s !== sym)].slice(0, 8);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('fs_recents', JSON.stringify(next));
+      }
+      return next;
+    });
+  };
+
+  const toggleSound = () => {
+    const next = !soundActive;
+    setSoundActive(next);
+    soundEngine.setEnabled(next);
+  };
+
+  const handleReconnectClick = () => {
+    if (onReconnect) {
+      setIsReconnecting(true);
+      onReconnect();
+      setTimeout(() => setIsReconnecting(false), 1200);
+    }
+  };
 
   // Funding countdown timer
   useEffect(() => {
@@ -109,15 +154,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
           <div className="hidden md:block">
             <div className="text-xs font-bold tracking-wider text-slate-200">FUTURES PRO</div>
-            <div className="text-[10px] font-mono flex items-center gap-2">
-              <span className="flex items-center gap-1">
-                <span className={`w-1.5 h-1.5 rounded-full ${marketConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
-                <span className={marketConnected ? 'text-emerald-400' : 'text-red-400'}>MKT</span>
+            <div className="text-[10px] font-mono flex items-center gap-1.5 mt-0.5">
+              <span className={`pill ${marketConnected ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30' : 'text-rose-400 bg-rose-500/10 border-rose-500/30'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${marketConnected ? 'bg-emerald-400 dot-pulse' : 'bg-rose-500'}`} />
+                <span>MKT</span>
               </span>
-              <span className="text-slate-600">|</span>
-              <span className="flex items-center gap-1">
-                <span className={`w-1.5 h-1.5 rounded-full ${depthConnected ? 'bg-cyan-400 animate-pulse' : 'bg-red-500'}`} />
-                <span className={depthConnected ? 'text-cyan-400' : 'text-red-400'}>DOM</span>
+              <span className={`pill ${depthConnected ? 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' : 'text-rose-400 bg-rose-500/10 border-rose-500/30'}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${depthConnected ? 'bg-cyan-400 dot-pulse' : 'bg-rose-500'}`} />
+                <span>DOM</span>
               </span>
             </div>
           </div>
@@ -147,6 +191,28 @@ export const Navbar: React.FC<NavbarProps> = ({
                   className="w-full bg-[#181d24] border border-[#2e3640] rounded-lg px-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 outline-none focus:border-emerald-500 font-mono uppercase"
                 />
               </div>
+              {recents.length > 0 && !searchQuery && (
+                <div className="p-2 border-b border-[#252b33] bg-[#14181f]">
+                  <div className="text-[10px] font-bold text-slate-500 flex items-center gap-1 mb-1.5 px-1">
+                    <History className="w-3 h-3 text-cyan-400" /> Son Bakılanlar
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {recents.map((rc) => (
+                      <button
+                        key={rc}
+                        onClick={() => handleSelectWithRecent(rc)}
+                        className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors ${
+                          rc === symbol
+                            ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40 font-bold'
+                            : 'bg-[#1a2028] text-slate-300 border-[#2a323d] hover:border-slate-500 hover:text-white'
+                        }`}
+                      >
+                        {rc}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="overflow-y-auto flex-1 divide-y divide-[#1e232b]">
                 {filteredSymbols.map((sym) => {
                   const t = tickers.find((x) => x.symbol === sym);
@@ -155,11 +221,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   return (
                     <div
                       key={sym}
-                      onClick={() => {
-                        onSelectSymbol(sym);
-                        setSearchOpen(false);
-                        setSearchQuery('');
-                      }}
+                      onClick={() => handleSelectWithRecent(sym)}
                       className="px-3 py-2 hover:bg-[#1f242c] cursor-pointer flex items-center justify-between group transition-colors"
                     >
                       <div className="flex items-center gap-2">
@@ -297,6 +359,35 @@ export const Navbar: React.FC<NavbarProps> = ({
         >
           <Sliders className="w-3.5 h-3.5" />
         </button>
+
+        <div className="h-4 w-[1px] bg-[#2e3640] mx-0.5" />
+
+        {/* Audio Alerts Toggle */}
+        <button
+          onClick={toggleSound}
+          className={`p-1.5 rounded-md transition-colors ${
+            soundActive
+              ? 'text-cyan-400 hover:bg-cyan-500/10'
+              : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/40'
+          }`}
+          title={soundActive ? 'Sesli Uyarılar: Açık' : 'Sesli Uyarılar: Kapalı'}
+        >
+          {soundActive ? <Volume2 className="w-3.5 h-3.5" /> : <VolumeX className="w-3.5 h-3.5" />}
+        </button>
+
+        {/* Manual WS Reconnect Button */}
+        {onReconnect && (
+          <button
+            onClick={handleReconnectClick}
+            disabled={isReconnecting}
+            className={`p-1.5 rounded-md text-slate-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors ${
+              isReconnecting ? 'animate-spin text-emerald-400' : ''
+            }`}
+            title="Bağlantıyı Yenile (Force WS Reconnect)"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+        )}
       </nav>
     </header>
   );

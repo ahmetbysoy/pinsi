@@ -69,8 +69,14 @@ export const SignalCard: React.FC<SignalCardProps> = ({
     return 'from-rose-500 to-orange-500';
   };
 
+  const getGlowClass = () => {
+    if (status === 'AL') return 'glow-up';
+    if (status === 'SAT') return 'glow-down';
+    return '';
+  };
+
   return (
-    <div className="bg-[#12161c] border border-[#22272e] rounded-xl p-4 flex flex-col gap-4 shadow-xl select-none">
+    <div className={`card-surface p-4 flex flex-col gap-4 select-none transition-all duration-300 ${getGlowClass()}`}>
       {/* Top Banner: Status + Rule */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-[#1f252e] pb-3">
         <div className="flex items-center gap-3">
@@ -246,6 +252,30 @@ export const SignalCard: React.FC<SignalCardProps> = ({
                   </span>
                 </div>
               </div>
+
+              {/* F2-5: Regime-conditional insight */}
+              {patternStats.regimes && Object.keys(patternStats.regimes).length > 0 && (
+                <div className="bg-[#11151b] p-2 rounded border border-[#1e242d] mt-1">
+                  <span className="text-[10px] text-slate-500 block mb-1">Piyasa Rejimleri Gücü (Örnek Dağılımı):</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {Object.values(patternStats.regimes)
+                      .filter((r) => r.n >= 5)
+                      .slice(0, 3)
+                      .map((r) => (
+                        <span
+                          key={r.key}
+                          className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                            r.winRate >= 50
+                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              : 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                          }`}
+                        >
+                          {r.key.replace('_', ' ')}: %{r.winRate.toFixed(0)} ({r.n}x, {r.avgRet10 > 0 ? '+' : ''}{r.avgRet10.toFixed(1)}%)
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="text-xs text-slate-500 italic p-3 bg-[#11151b] rounded-lg border border-[#1e242d] text-center">
